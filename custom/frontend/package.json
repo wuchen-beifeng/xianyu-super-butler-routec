@@ -1,0 +1,27 @@
+{
+  "name": "xianyu-super-butler-frontend",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node -e \"console.error('Standalone frontend server is disabled. Run python Start.py from the project root.'); process.exit(1)\"",
+    "build": "node scripts/clean-build-output.mjs && vite build",
+    "preview": "node -e \"console.error('Standalone frontend preview is disabled. Open http://localhost:8080/ after running python Start.py.'); process.exit(1)\""
+  },
+  "dependencies": {
+    "axios": "^1.13.2",
+    "lucide-react": "^0.562.0",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3",
+    "recharts": "^3.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "autoprefixer": "^10.4.23",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^3.4.17",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.0"
+  }
+}

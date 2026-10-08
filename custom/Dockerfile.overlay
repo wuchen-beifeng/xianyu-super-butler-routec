@@ -1,0 +1,173 @@
+# 闲鱼超级管家 — 叠加构建（overlay build）
+#
+# 为什么用叠加而不是从源码全量构建：
+#   上游 Dockerfile 要跑 npm ci + vite build + pip 编译 + 下载 Chromium，
+#   在 VM102（3.8G 内存）上会 CPU 打满、内存耗尽，上游文档自己也警告「低配设备不要本地构建」。
+#   而叠加构建只加一层薄薄的 COPY，**复用预构建镜像的全部重层**，秒级完成、零编译。
+#   （唯一例外：前端 —— 见下方 frontend-builder 阶段，只跑 vite，不碰 python/chromium。）
+#
+# 用法（在 /root/docker/xianyu-butler/custom/ 下）：
+#   docker build -f Dockerfile.overlay -t xianyu-super-butler:custom .
+#
+# 何时需要重建：本目录下任一文件改动后。
+# 何时需要回到官方镜像：把 compose.yaml 的 image 改回 ghcr.io/23star/... 即可（本镜像不影响它）。
+
+# ── 前端构建阶段（multi-stage，T7/v2 新增）────────────────────────────────────
+# T7 删掉了账号页的「人工验证（投屏拖动）」入口，需要重新产出 /app/static。
+# 上游只预构建了产物、没留构建入口；这里用 node:20-alpine 复现上游同一套
+# `npm ci + vite build`（package-lock.json 已入库，构建可复现）。
+# 只构建到 /frontend/dist，再由下方主阶段 COPY 进 /app/static。
+FROM node:20-alpine AS frontend-builder
+WORKDIR /frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY frontend/ ./
+RUN VITE_OUT_DIR=dist npm run build \
+    && test -f /frontend/dist/index.html \
+    && echo "overlay(t7): frontend built"
+
+
+FROM ghcr.io/23star/xianyu-super-butler:latest
+
+# 新增：验证码识别客户端（默认关闭，见 global_config.yml 的 CAPTCHA_RECOGNITION）
+COPY utils/captcha_recognition.py /app/utils/captcha_recognition.py
+
+# 修改：app/config.py 增加 CAPTCHA_RECOGNITION 配置项加载
+COPY app/config.py /app/app/config.py
+
+# 修改：global_config.yml 增加 CAPTCHA_RECOGNITION 段（enabled 默认 false）
+COPY global_config.example.yml /app/global_config.yml
+
+# 构建期自检：坏代码/坏 YAML 不进容器
+RUN python -m py_compile /app/utils/captcha_recognition.py /app/app/config.py \
+    && python -c "import yaml; yaml.safe_load(open('/app/global_config.yml'))" \
+    && python -c "import ast; ast.parse(open('/app/utils/captcha_recognition.py').read())" \
+    && echo "overlay: syntax + yaml OK"
+
+# ── T8 修复（2026-10-08）：浏览器运行时 ───────────────────────────────────────
+# 背景：上游 latest 镜像只装了 playwright 1.60 的 Chromium（chromium-1223），而
+# patchright 1.63 期望 chromium-1243 —— 当初滑块（有头 patchright）每次都在
+# init_browser 报 `Executable doesn't exist at /ms-playwright/chromium-1243/...`。
+#
+# ⚠️ T7（v2）之后这些运行时**不再服务滑块**（容器内滑块方案已整体删除），但**保留**：
+#   - chromium-1243：扫码登录 / 浏览器 Cookie 刷新等链路可能用到；
+#   - 系统 Google Chrome：utils/refresh_util.py 直接探测 /usr/bin/google-chrome；
+#   - mesa GL + CJK 字体：浏览器渲染依赖。
+# 删它们属于「未验证的副作用」，不在 T7 范围内。
+RUN patchright install chromium --no-shell --no-remove \
+    && test -x /ms-playwright/chromium-1243/chrome-linux64/chrome \
+    && echo "overlay(t8): chromium-1243 ready"
+
+RUN curl -fsSL -o /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+    && apt-get update -qq \
+    && apt-get install -y -qq /tmp/chrome.deb \
+       libgl1 libglx-mesa0 libgl1-mesa-dri libegl1 libgles2 \
+       fonts-noto-cjk fonts-liberation fonts-dejavu-core \
+    && rm -f /tmp/chrome.deb \
+    && /opt/google/chrome/chrome --version \
+    && echo "overlay(t8): system chrome + mesa GL + fonts ready"
+
+# ── T7 集成（2026-10-08 / v2 修订 2026-10-09）：路线 C 是滑块唯一路径 ──────────
+# 容器内浏览器滑块在本栈实测通过率 **0**（阿里 nc 不接受自动化输入），
+# 唯一实测可用的是 **路线 C**：VM101 的 Chrome + 真机 user32!SendInput 拖动，
+# 由容器内 `routec-solver`（127.0.0.1:8799）编排，经 VM100 隧道端口
+# （<VM100_IP>:8791 驱动 / 9222 CDP）访问 VM101。
+#   a) 新增 utils/slider_route_c.py —— 后端客户端 + 熔断 + 一键停用开关
+#   b) XianyuAutoAsync.py 的 _handle_captcha_verification **只走路线 C**，失败不回退
+#   c) global_config.yml / app/config.py 新增 SLIDER_ROUTE_C 段（本层上方已 COPY）
+COPY utils/slider_route_c.py /app/utils/slider_route_c.py
+COPY XianyuAutoAsync.py /app/XianyuAutoAsync.py
+RUN python -m py_compile /app/utils/slider_route_c.py /app/XianyuAutoAsync.py \
+    && echo "overlay(t7): route C client + captcha integration syntax OK"
+
+# ── T7 整合（2026-10-08）：routec-solver 纳入镜像 ──────────────────────────
+# 求解器从 VM100 的 systemd 服务搬进容器：容器内启动 127.0.0.1:8799，
+# driver/CDP 经 VM100 隧道端口（<VM100_IP>:8791/9222）访问 VM101。
+COPY slider_routec /app/slider_routec
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/slider_routec/start.sh \
+    && python -m py_compile /app/slider_routec/solver.py /app/slider_routec/routec_core.py /app/slider_routec/preflight.py /app/slider_routec/driverctl.py /app/slider_routec/humanize.py /app/slider_routec/xianyu_api.py \
+    && sh -n /app/entrypoint.sh \
+    && python -c "import yaml; yaml.safe_load(open('/app/global_config.yml'))" \
+    && echo "overlay(t7): routec-solver integrated OK"
+
+# ── T6-tombstone(2026-10-08)：商品墓碑（删除本地记录不再被同步写回）────────
+COPY app/db_manager.py /app/app/db_manager.py
+COPY app/reply_server.py /app/app/reply_server.py
+
+# ── T7（v2, 2026-10-09）：删除上游浏览器滑块 + 人工投屏链路，只留扫码登录 ──────
+# 依据：容器内浏览器滑块通过率 0（纯浪费时间与账号请求）；人工投屏 v2 明确不要。
+# 保留：扫码登录（utils/qr_login.py）、browser_pool/browser_limit、captcha_recognition.py。
+#
+# 1) 删除上游模块本体 —— 它们来自上游镜像，不 COPY 就删不掉，必须显式 rm
+RUN rm -f /app/utils/xianyu_slider_stealth.py \
+          /app/utils/slider_patch.py \
+          /app/utils/manual_captcha.py \
+          /app/utils/captcha_remote_control.py \
+          /app/app/api_captcha_remote.py \
+          /app/scripts/diag_slider.py \
+          /app/scripts/get_punish_url.py \
+          /app/scripts/train_slider.py
+
+# 2) item_search.py：去掉 stealth 回退调用与刮刮乐人工链路
+COPY utils/item_search.py /app/utils/item_search.py
+
+# 3) 前端产物：账号页的「人工验证」投屏入口已删
+#    （保留「在我的浏览器打开验证页」，它不依赖被删的模块）
+#    先清掉上游镜像里的旧 assets —— COPY 是合并语义，不清就会把上一版（含「人工验证」
+#    按钮）的 chunk 一起留在镜像里。index.html 引用的是新 hash，旧文件不会被执行，
+#    但「删除」应当彻底。
+RUN rm -rf /app/static/assets
+COPY --from=frontend-builder /frontend/dist/ /app/static/
+
+# 4) 构建期硬自检：三个模块 + 三个引用点必须全部消失，否则构建失败
+RUN python -m py_compile /app/app/db_manager.py /app/app/reply_server.py \
+       /app/utils/item_search.py /app/utils/slider_route_c.py /app/XianyuAutoAsync.py \
+    && echo "overlay(t7): py_compile OK" \
+    && ( grep -rnE "xianyu_slider_stealth|slider_patch|XianyuSliderStealth|manual_captcha|captcha_remote_control|api_captcha_remote" /app --include=*.py \
+         && echo "overlay(t7): ✗ 仍有残留引用，构建中止" && exit 1 \
+         || echo "overlay(t7): 上游浏览器滑块 + 人工投屏链路已彻底删除" ) \
+    && ( grep -rl "人工验证" /app/static \
+         && echo "overlay(t7): ✗ 前端产物仍含「人工验证」入口，构建中止" && exit 1 \
+         || echo "overlay(t7): 前端产物已无「人工验证」入口" )
+
+# ── T5（2026-10-09）：路线 C 重试策略 + 失败 QQ 通知（NapCat / OneBot v11）──────
+# 1) 客户端重试：utils/slider_route_c.py（本层上方已随 T7 段 COPY，此处不重复）
+#    —— 一个 solve() = 整个重试序列，max_attempts 默认 5（env > system_settings
+#       > global_config.yml），序列内间隔 ≥3s，熔断按「序列」计一次失败。
+# 2) 通知渠道：新增 qq 类型。上游镜像自带这三个模块且 overlay 此前未改过，
+#    要改必须整文件 COPY 覆盖（不 COPY 就改不到）。
+COPY app/services/notification_channels.py /app/app/services/notification_channels.py
+COPY app/services/notification_sender.py /app/app/services/notification_sender.py
+COPY app/notification_events.py /app/app/notification_events.py
+# 3) 运行时投递路径：XianyuAutoAsync.send_token_refresh_notification 自带
+#    match channel_type 分支，必须加 qq 分支，否则运行期渠道会被判「不支持」。
+#    （XianyuAutoAsync.py 已随 T7 段 COPY，此处只做断言）
+RUN python -m py_compile \
+      /app/app/services/notification_channels.py \
+      /app/app/services/notification_sender.py \
+      /app/app/notification_events.py \
+      /app/utils/slider_route_c.py \
+      /app/XianyuAutoAsync.py \
+    && cd /app \
+    && python -c "from app.services.notification_channels import NOTIFICATION_CHANNEL_REQUIRED_FIELDS as F; assert F.get('qq') == ('base_url','user_id'), 'qq 渠道缺失/字段不符'; assert F.get('qq') == ('base_url','user_id')" \
+    && python -c "from app.services.notification_channels import normalize_channel_type as n; assert n('napcat')=='qq' and n('onebot')=='qq'" \
+    && python -c "from app.services.notification_sender import NotificationSender as S; assert hasattr(S,'_send_qq'), 'NotificationSender 缺 _send_qq'" \
+    && python -c "from app.notification_events import TOKEN_NOTIFICATION_EVENT_MAP as M; assert M.get('captcha_route_c_exhausted')=='captcha_manual', '事件映射缺失'" \
+    && grep -q "def _send_qq_notification" /app/XianyuAutoAsync.py \
+    && grep -q "case 'qq'" /app/XianyuAutoAsync.py \
+    && python -c "from utils import slider_route_c as S; assert S.DEFAULTS['max_attempts'] == 5; assert S._clamp_attempts(0) == 1 and S._clamp_attempts(999) == S.MAX_ATTEMPTS_CEILING" \
+    && echo "overlay(t5): 重试策略 + qq 渠道 OK"
+
+# ── T3（2026-10-09）：容器侧前置体检 + 自愈（六项），接入求解器 ──────────────────
+# slider_routec/preflight.py 随上方 `COPY slider_routec` 一并进镜像；这里做构建期硬自检：
+#   1) preflight.py 语法通过、check_and_heal 可调用、整体上限 90s；
+#   2) routec_core 在拖动前调用它；
+#   3) 客户端 utils/slider_route_c.py 透传 preflight 到 info。
+RUN python -m py_compile /app/slider_routec/preflight.py \
+    && cd /app/slider_routec \
+    && python -c "import preflight; assert callable(preflight.check_and_heal), 'check_and_heal 不可调用'; assert preflight.OVERALL_MAX_S == 90.0, '整体上限必须 90s'" \
+    && grep -q "preflight.check_and_heal" /app/slider_routec/routec_core.py \
+    && grep -q '"preflight"' /app/utils/slider_route_c.py \
+    && grep -q '"preflight"' /app/slider_routec/solver.py \
+    && echo "overlay(t3): preflight 六项体检 + 自愈 OK"

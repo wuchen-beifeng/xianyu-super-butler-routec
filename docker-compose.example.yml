@@ -1,0 +1,55 @@
+# 闲鱼超级管家 —— 路线 C 二次修改版
+# docker compose 示例文件。
+#
+# 用法：
+#   cp docker-compose.example.yml docker-compose.yml
+#   cp .env.example .env      # 改掉里面的占位符
+#   docker compose up -d
+#
+# 镜像有两种用法：
+#   A) 直接用上游预构建镜像（快速体验，**不含**本仓库的改动）：
+#        image: ghcr.io/23star/xianyu-super-butler:latest
+#   B) 用本仓库的叠加构建（**含**路线 C / 隐藏商品 / QQ 通知等改动，推荐）：
+#        cd custom && docker build -f Dockerfile.overlay -t xianyu-super-butler:custom .
+#        # 然后保持下面 image 为 xianyu-super-butler:custom
+#
+# 说明：上游 Dockerfile 需要 npm ci + vite build + pip 编译 + 下载 Chromium，
+# 在低配设备（<=4G 内存）上会打满 CPU / 耗尽内存；本仓库的叠加构建只加一层薄 COPY，
+# 复用预构建镜像的全部重层，秒级完成。详见 README.md 与 docs/。
+
+services:
+  xianyu-app:
+    # 见文件头 A/B 两种用法。默认用本仓库构建出的自有镜像。
+    image: xianyu-super-butler:custom
+    container_name: xianyu-super-butler
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      DB_PATH: /app/data/xianyu_data.db
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+    volumes:
+      - ./data:/app/data:rw
+      - ./logs:/app/logs:rw
+      - ./backups:/app/backups:rw
+      # 浏览器持久化 profile（扫码登录 / cookie 刷新用）。
+      # 不挂卷时每次容器重建 profile 清零。
+      - ./browser_data:/app/browser_data:rw
+    # Chromium 在容器里默认 64M /dev/shm 容易崩，放大到 1G（tmpfs，不占磁盘）
+    shm_size: 1gb
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    deploy:
+      resources:
+        limits:
+          memory: ${MEMORY_LIMIT:-3072M}
+          cpus: "4.0"   # 有头浏览器是突发型算力需求，2 核实测会被节流；按宿主机核数调整
+        reservations:
+          memory: ${MEMORY_RESERVATION:-512M}
+          cpus: "${CPU_RESERVATION:-0.5}"

@@ -1,0 +1,116 @@
+API_ENDPOINTS:
+  login_check: https://passport.goofish.com/newlogin/hasLogin.do
+  message_headinfo: https://h5api.m.goofish.com/h5/mtop.idle.trade.pc.message.headinfo/1.0/
+  token: https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/
+APP_CONFIG:
+  api_version: '1.0'
+  app_key: 444e9908a51d1cb236a27862abc769c9
+  app_version: '1.0'
+  platform: web
+AUTO_REPLY:
+  api:
+    enabled: false  # 禁用API回复，使用AI回复或关键词回复
+    host: 0.0.0.0  # 绑定所有网络接口，支持IP访问
+    port: 8080     # Web服务端口
+    timeout: 10
+    url: http://localhost:8080/xianyu/reply  # 修复URL地址
+  default_message: 亲爱的"{send_user_name}" 老板你好！所有宝贝都可以拍，秒发货的哈~不满意的话可以直接申请退款哈~
+  enabled: true
+  max_retry: 3
+  retry_interval: 5
+ITEM_DETAIL:
+  auto_fetch:
+    enabled: true  # 是否启用自动获取商品详情
+    api_url: https://selfapi.zhinianboke.com/api/getItemDetail  # 外部API地址
+    timeout: 30  # 请求超时时间（秒）
+    max_concurrent: 3  # 最大并发请求数
+    retry_delay: 0.5  # 请求间隔（秒）
+ITEM_SYNC:
+  enabled: true  # 是否启用定时自动同步商品
+  interval: 600  # 同步间隔时间（秒），10分钟
+  max_pages: 5  # 每次最多同步的页数，None表示无限制
+COOKIES:
+  last_update_time: ''
+  value: ""        # ← 留空：首次部署后在面板扫码登录，或填自己的 cookie
+DEFAULT_HEADERS:
+  accept: application/json
+  accept-language: zh-CN,zh;q=0.9
+  cache-control: no-cache
+  origin: https://www.goofish.com
+  pragma: no-cache
+  priority: u=1, i
+  referer: https://www.goofish.com/
+  sec-ch-ua: '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"'
+  sec-ch-ua-mobile: ?0
+  sec-ch-ua-platform: '"Windows"'
+  sec-fetch-dest: empty
+  sec-fetch-mode: cors
+  sec-fetch-site: same-site
+  user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
+    like Gecko) Chrome/133.0.0.0 Safari/537.36
+HEARTBEAT_INTERVAL: 15
+HEARTBEAT_TIMEOUT: 30
+LOG_CONFIG:
+  compression: zip
+  format: '<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level>
+    | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>'
+  level: INFO
+  retention: 7 days
+  rotation: 1 day
+MANUAL_MODE:
+  enabled: false
+  timeout: 3600
+  toggle_keywords: []
+MESSAGE_EXPIRE_TIME: 300000
+TOKEN_REFRESH_INTERVAL: 3600  # 从3600秒(1小时)增加到72000秒(20小时)
+TOKEN_RETRY_INTERVAL: 600    # 从300秒(5分钟)增加到7200秒(2小时)
+SLIDER_VERIFICATION:
+  max_concurrent: 1  # 滑块验证最大并发数。浏览器很吃 CPU，并发拉起会互相拖慢并降低通过率
+  wait_timeout: 60   # 等待排队超时时间（秒）
+SLIDER_ROUTE_C:
+  # 路线 C（VM101 真机 SendInput 后端，T7 集成）—— 滑块验证的**唯一**路径。
+  # 容器内浏览器方案在本栈实测通过率 0（阿里 nc 不接受自动化输入），
+  # 已于 v2（T7）连同人工投屏链路整体删除；路线 C 实测 77~83%。
+  # 后端不可用/失败时**不再回退**，直接记失败并触发人工处理提醒。
+  # 一键停用（不改配置、不重建）：docker exec xianyu-super-butler \
+  #   touch /app/data/SLIDER_ROUTE_C_DISABLED
+  # 环境变量 SLIDER_ROUTE_C_* 可覆盖本节任意项（见 .env）。
+  enabled: true
+  endpoint: "http://127.0.0.1:8799"   # 容器内 routec-solver（T7 整合进镜像）
+  timeout: 180          # 单轮求解超时（秒）；实测一轮 ~37s
+  connect_timeout: 5    # 后端不在时快速失败
+  failure_threshold: 3  # 连续失败 N 个「重试序列」→ 熔断（不是每轮都计数）
+  cooldown: 600         # 熔断冷却（秒）
+  verify: false         # 让后端顺带做一次闭环 API 校验（调试用，多一次 mtop 调用）
+  # ── T5（2026-10-09）重试策略 ─────────────────────────────────────────────
+  # 一个求解序列内最多尝试几轮（默认 5）；每轮失败后间隔 ≥3s 再来一轮，
+  # 每轮都是独立的 POST /solve（后端重新注入 cookie、取新挑战）。
+  # 三级可配，优先级从高到低：环境变量 SLIDER_ROUTE_C_MAX_ATTEMPTS
+  #   > system_settings['slider_route_c_max_attempts']（面板可改，热生效）
+  #   > 本项。全部失败才算一次失败（熔断器按序列计数）。
+  max_attempts: 5
+  retry_interval: 3     # 序列内相邻两轮的最小间隔（秒），硬下限 3
+CAPTCHA_RECOGNITION:
+  # 图像型验证码识别（ddddocr 服务客户端，实现在 utils/captcha_recognition.py）
+  # 默认关闭：关闭时所有识别方法立即返回 None，不发起任何网络请求
+  # 注意：闲鱼 punish 的 nc 滑块是「拖到底」型，没有缺口，本模块对它无用；
+  #       它面向的是拼图型滑块 / 点选 / 文字 / 算术等图像型验证码
+  enabled: false
+  base_url: "http://<NAS_IP>:7777"   # 飞牛 NAS 上的 ddddocr 服务（占位符，按实际替换）
+  timeout: 30
+  failure_cooldown: 60                   # 连续失败后的静默期（秒），避免拖慢主流程
+  use_for_puzzle_slider: true            # 拼图型滑块缺口定位
+  use_for_click_select: true             # 点选验证码
+  use_for_text_captcha: true             # 文字验证码
+  use_for_calculate: true                # 算术验证码
+WEBSOCKET_HEADERS:
+  Accept-Encoding: gzip, deflate, br, zstd
+  Accept-Language: zh-CN,zh;q=0.9
+  Cache-Control: no-cache
+  Connection: Upgrade
+  Host: wss-goofish.dingtalk.com
+  Origin: https://www.goofish.com
+  Pragma: no-cache
+  User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
+    like Gecko) Chrome/133.0.0.0 Safari/537.36
+WEBSOCKET_URL: wss://wss-goofish.dingtalk.com/

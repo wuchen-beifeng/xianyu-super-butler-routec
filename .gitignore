@@ -1,0 +1,29 @@
+# ── 凭据 / 令牌：绝不入库 ───────────────────────────────────────────────
+.env
+*.pw
+*.token
+*.pem
+*.key
+custom/slider_routec/token
+custom/global_config.yml
+
+# ── 运行期数据：绝不入库 ───────────────────────────────────────────────
+data/
+logs/
+backups/
+browser_data/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# ── 构建产物 ──────────────────────────────────────────────────────────
+custom/frontend/dist/
+custom/frontend/node_modules/
+**/__pycache__/
+*.pyc
+
+# ── 编辑器 / 系统 ─────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
