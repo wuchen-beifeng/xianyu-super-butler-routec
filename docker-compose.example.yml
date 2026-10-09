@@ -6,12 +6,17 @@
 #   cp .env.example .env      # 改掉里面的占位符
 #   docker compose up -d
 #
-# 镜像有两种用法：
-#   A) 直接用上游预构建镜像（快速体验，**不含**本仓库的改动）：
-#        image: ghcr.io/23star/xianyu-super-butler:latest
-#   B) 用本仓库的叠加构建（**含**路线 C / 隐藏商品 / QQ 通知等改动，推荐）：
+# 镜像有两种用法（详见 README.md §3.1）：
+#   A) 【推荐】用发布好的预构建镜像（含路线 C / 隐藏商品 / QQ 通知的全部改动，不用构建）：
+#        image: wuchen986/xianyu-super-butler:latest
+#        发布镜像**不含** slider_routec/token，按下面 volumes 里的注释挂载自己的 token
+#        （或让求解器跑不鉴权模式）。
+#   B) 本地叠加构建（改过 custom/ 下文件时用）：
 #        cd custom && docker build -f Dockerfile.overlay -t xianyu-super-butler:custom .
 #        # 然后保持下面 image 为 xianyu-super-butler:custom
+#        ⚠️ 叠加构建会把 custom/slider_routec/token COPY 进镜像，别把该镜像推公开仓库。
+#
+# 上游原版（不含本仓库改动）：ghcr.io/23star/xianyu-super-butler:latest
 #
 # 说明：上游 Dockerfile 需要 npm ci + vite build + pip 编译 + 下载 Chromium，
 # 在低配设备（<=4G 内存）上会打满 CPU / 耗尽内存；本仓库的叠加构建只加一层薄 COPY，
@@ -19,8 +24,8 @@
 
 services:
   xianyu-app:
-    # 见文件头 A/B 两种用法。默认用本仓库构建出的自有镜像。
-    image: xianyu-super-butler:custom
+    # 见文件头 A/B 两种用法。默认用本仓库发布到 Docker Hub 的预构建镜像。
+    image: wuchen986/xianyu-super-butler:latest
     container_name: xianyu-super-butler
     restart: unless-stopped
     env_file:
@@ -37,6 +42,16 @@ services:
       # 浏览器持久化 profile（扫码登录 / cookie 刷新用）。
       # 不挂卷时每次容器重建 profile 清零。
       - ./browser_data:/app/browser_data:rw
+      # ── 路线 C 求解器鉴权 token（可选）───────────────────────────────
+      # 发布镜像里没有这个文件。要用鉴权就先生成，再取消下面这行的注释：
+      #   mkdir -p custom/slider_routec
+      #   printf '%s' "$(openssl rand -hex 24)" > custom/slider_routec/token
+      #   chmod 600 custom/slider_routec/token
+      #   # 并把同一个值填进 .env 的 SLIDER_ROUTE_C_TOKEN
+      # 不挂（保持注释）则求解器以 token=off 运行：它只监听容器内 127.0.0.1:8799，
+      # 不对宿主机暴露，可以接受。注意：token 文件不存在时**不要**留这条挂载，
+      # 否则 Docker 会在宿主机上创建一个同名目录。
+      # - ./custom/slider_routec/token:/app/slider_routec/token:ro
     # Chromium 在容器里默认 64M /dev/shm 容易崩，放大到 1G（tmpfs，不占磁盘）
     shm_size: 1gb
     healthcheck:

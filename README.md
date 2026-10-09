@@ -8,6 +8,7 @@
 > （阿里 nc 不接受 CDP 派发的合成鼠标事件）。本仓库保留上游的扫码登录、发货、AI 回复等全部能力，
 > 只替换滑块这一环。
 
+- 预构建镜像（公开）：`docker pull wuchen986/xianyu-super-butler:latest` —— 含本仓库全部改动，免本地构建
 - 许可证：**AGPL-3.0**（与上游一致，见 [`LICENSE`](LICENSE)）
 - 上游基线提交：`697bdb4f750311d20e3fe46d16666d464eda4903`（2026-10-08）
 
@@ -56,6 +57,7 @@
 | **重试策略** | 一次求解序列最多重试 5 轮（可配），熔断按「整个序列」计一次失败 |
 | **QQ 通知** | 新增 `qq` 渠道类型（NapCat / OneBot v11），滑块序列耗尽走既有 `captcha_manual` 事件 |
 | **构建** | 叠加构建（overlay）：复用上游预构建镜像的全部重层，只加薄薄一层 COPY；前端用 multi-stage `node:20-alpine` 现场构建 |
+| **发布** | 叠加构建产物已推到 Docker Hub 公开仓库 `wuchen986/xianyu-super-butler`（发布镜像**不含** `slider_routec/token`，密钥一律运行时挂载） |
 
 **明确不做**：在闲鱼侧删除 / 下架商品。全量检索确认项目内不存在任何下架类 MTOP 调用
 （`mtop.idle.item.offline` / `.delete` 都不在代码里），本仓库只做「在本界面隐藏」。
@@ -72,34 +74,90 @@
 
 ### 3.1 应用机（`<VM102_IP>`）
 
+两种方式二选一：**方式 A** 直接用发布好的预构建镜像（推荐，不用构建），**方式 B** 本地叠加构建。
+
+先拉代码与配置（两种方式都要）：
+
 ```bash
 git clone <本仓库地址> xianyu-butler && cd xianyu-butler
-
-# 1) 准备配置
 cp docker-compose.example.yml docker-compose.yml
 cp .env.example .env && chmod 600 .env
-#    改掉 .env 里所有 <...> 占位符；SLIDER_ROUTE_C_TOKEN 用 openssl rand -hex 24 生成
+#    改掉 .env 里所有 <...> 占位符
+```
 
-# 2) 路线 C 令牌：容器内求解器与客户端用同一个
-mkdir -p custom/slider_routec
-printf '%s' '<与 .env 里 SLIDER_ROUTE_C_TOKEN 相同的值>' > custom/slider_routec/token
-chmod 600 custom/slider_routec/token
+#### 方式 A（推荐）：用发布好的预构建镜像
 
-# 3) 叠加构建（秒级；不编译 python、不下载 Chromium）
-cd custom && docker build -f Dockerfile.overlay -t xianyu-super-butler:custom .
-cd ..
+镜像已推到 Docker Hub **公开仓库**，含路线 C / 隐藏商品 / QQ 通知的全部改动：
 
-# 4) 起服务
+```bash
+docker pull wuchen986/xianyu-super-butler:latest
+# 也可固定到日期版本：wuchen986/xianyu-super-butler:20261009
+```
+
+`docker-compose.yml` 里设成：
+
+```yaml
+image: wuchen986/xianyu-super-butler:latest
+```
+
+> ⚠️ **发布镜像里不含 `slider_routec/token`**（公开镜像不放任何密钥）。
+> 求解器要读到 token 文件才开启鉴权，二选一：
+>
+> **① 挂载自己的 token（推荐）**
+>
+> ```bash
+> mkdir -p custom/slider_routec
+> printf '%s' "$(openssl rand -hex 24)" > custom/slider_routec/token
+> chmod 600 custom/slider_routec/token
+> # 把上面这个值原样填进 .env 的 SLIDER_ROUTE_C_TOKEN
+> ```
+>
+> ```yaml
+> volumes:
+>   # …原有的 data / logs / backups / browser_data…
+>   - ./custom/slider_routec/token:/app/slider_routec/token:ro
+> ```
+>
+> **② 不鉴权**：`.env` 的 `SLIDER_ROUTE_C_TOKEN` 留空、也不挂 token 文件。
+> 求解器只监听容器内 `127.0.0.1:8799`，不对宿主机暴露，所以可以接受；
+> 启动日志会打印 `token=off`。
+
+起服务：
+
+```bash
 docker compose up -d
 docker compose ps                       # 等 healthy
 curl -fsS http://localhost:8080/health
 ```
 
+#### 方式 B：本地叠加构建
+
+改过 `custom/` 下任何文件、或不想用发布镜像时用：
+
+```bash
+# 1) 路线 C 令牌：容器内求解器与客户端用同一个
+mkdir -p custom/slider_routec
+printf '%s' '<与 .env 里 SLIDER_ROUTE_C_TOKEN 相同的值>' > custom/slider_routec/token
+chmod 600 custom/slider_routec/token
+
+# 2) 叠加构建（秒级；不编译 python、不下载 Chromium）
+cd custom && docker build -f Dockerfile.overlay -t xianyu-super-butler:custom .
+cd ..
+
+# 3) 把 docker-compose.yml 的 image 改成 xianyu-super-butler:custom，然后起服务
+docker compose up -d
+```
+
+> ⚠️ 叠加构建的 `COPY slider_routec /app/slider_routec` 会把 `custom/slider_routec/token`
+> **一起打进镜像**，所以本地构建出的 `xianyu-super-butler:custom` 含你的生产 token。
+> **别把它推到公开仓库。** 想推公开镜像请用方式 A，或在 `custom/` 下放一份
+> `.dockerignore`（内容一行 `slider_routec/token`）并改为挂载 token。
+
 打开 `http://<VM102_IP>:8080`，用 `.env` 里的 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 登录
 （注意：`ADMIN_PASSWORD` **只在首次建库时生效**，之后改请在面板里改）。
 
-> **不想用叠加构建？** 也可以直接把 `docker-compose.yml` 的 image 换成上游
-> `ghcr.io/23star/xianyu-super-butler:latest` —— 但那样**不含本仓库的任何改动**。
+> **只想用上游原版？** 把 image 换成 `ghcr.io/23star/xianyu-super-butler:latest` ——
+> 但那样**不含本仓库的任何改动**。
 
 ### 3.2 真机（`<VM101_IP>`，Windows）
 
