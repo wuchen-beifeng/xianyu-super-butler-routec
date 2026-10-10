@@ -1,3 +1,12 @@
+# global_config.example.yml — 容器配置**模板**（脱敏，不含任何 cookie / token / 密钥）
+#
+# 用法：cp custom/global_config.example.yml custom/global_config.yml，再按需修改。
+#   * 本文件会被 Dockerfile.overlay `COPY global_config.yml /app/global_config.yml` 打进镜像，
+#     所以改完要重新叠加构建（见本目录 README.md）。仓库里**只有**这个 example，
+#     `global_config.yml` 本身被 .gitignore 忽略 —— 干净克隆后必须先复制出来才能构建。
+#   * 三期（发布 / 下架 / 密码登录 / 写限流 / 二次确认）的开关**不在本文件**：它们存在运行时表
+#     system_settings，在面板「设置」里改、热生效（键表见仓库根 README §4.11）。
+#   * COOKIES.value 留空：首次部署后在面板扫码登录，或自行填 cookie 串（别把真值提交进仓库）。
 API_ENDPOINTS:
   login_check: https://passport.goofish.com/newlogin/hasLogin.do
   message_headinfo: https://h5api.m.goofish.com/h5/mtop.idle.trade.pc.message.headinfo/1.0/

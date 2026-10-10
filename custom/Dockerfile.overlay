@@ -36,7 +36,7 @@ COPY utils/captcha_recognition.py /app/utils/captcha_recognition.py
 COPY app/config.py /app/app/config.py
 
 # 修改：global_config.yml 增加 CAPTCHA_RECOGNITION 段（enabled 默认 false）
-COPY global_config.example.yml /app/global_config.yml
+COPY global_config.yml /app/global_config.yml
 
 # 构建期自检：坏代码/坏 YAML 不进容器
 RUN python -m py_compile /app/utils/captcha_recognition.py /app/app/config.py \
@@ -79,6 +79,16 @@ COPY utils/slider_route_c.py /app/utils/slider_route_c.py
 COPY XianyuAutoAsync.py /app/XianyuAutoAsync.py
 RUN python -m py_compile /app/utils/slider_route_c.py /app/XianyuAutoAsync.py \
     && echo "overlay(t7): route C client + captcha integration syntax OK"
+
+# ── W5（2026-10-10）：图片上传补齐 width/height ────────────────────────────────
+# upload_image() 从「只返回 url 字符串」改为返回 {"url","width","height","size"}
+# （width/height 取自上传响应 object.pix，如 "1024x1024"），供发布 payload 的
+# imageInfoDOList 使用；XianyuAutoAsync.py 的 5 处调用点已显式改为取 ["url"]。
+# 该文件来自上游镜像（overlay 此前未改过），不 COPY 就改不到。
+COPY utils/image_uploader.py /app/utils/image_uploader.py
+RUN python -m py_compile /app/utils/image_uploader.py \
+    && grep -q "_build_image_info" /app/utils/image_uploader.py \
+    && echo "overlay(w5): image_uploader width/height OK"
 
 # ── T7 整合（2026-10-08）：routec-solver 纳入镜像 ──────────────────────────
 # 求解器从 VM100 的 systemd 服务搬进容器：容器内启动 127.0.0.1:8799，
@@ -171,3 +181,127 @@ RUN python -m py_compile /app/slider_routec/preflight.py \
     && grep -q '"preflight"' /app/utils/slider_route_c.py \
     && grep -q '"preflight"' /app/slider_routec/solver.py \
     && echo "overlay(t3): preflight 六项体检 + 自愈 OK"
+
+# ── W4 回归补回（2026-10-10, W8 卡）：写限流三件套 ─────────────────────────────
+# 事实：W4（t_ff418260）构建镜像 a9438a66cd65 时确实 COPY 过这三个文件
+# （见 `docker history` 层），但随后并发的 W5 构建用旧版 Dockerfile 覆盖了整个
+# 文件，三行 COPY 丢失 —— 结果 write_guard.py 没进镜像，任何 `from utils.write_guard
+# import acquire_write` 都会 ImportError。此处按 W4 原样补回，不做任何改动。
+COPY utils/write_guard.py /app/utils/write_guard.py
+COPY utils/risk_control.py /app/utils/risk_control.py
+COPY utils/item_polish.py /app/utils/item_polish.py
+
+# ── W8（2026-10-10）：下架 / 删除链路（com.taobao.idle.item.delete v1.1）───────
+COPY utils/item_delete.py /app/utils/item_delete.py
+RUN python -m py_compile /app/utils/write_guard.py /app/utils/risk_control.py \
+      /app/utils/item_polish.py /app/utils/item_delete.py \
+    && grep -q "def acquire_write" /app/utils/write_guard.py \
+    && grep -q "com.taobao.idle.item.delete" /app/utils/item_delete.py \
+    && python -c "import ast; ast.parse(open('/app/utils/item_delete.py', encoding='utf-8').read())" \
+    && echo "overlay(w8): write_guard 补回 + item_delete 语法 OK"
+
+# ── W6（2026-10-10）：密码登录编排（CDP 导航 + VM101 真机 SendInput）──────────
+# 新增 utils/password_login.py：免密刷新**连续失败 5 次**后触发（阈值/冷却/开关都在
+# system_settings 的 pwd_login_* 键，面板可改热生效）；经 CDP 连 VM101 常驻 Chrome
+# 完成「账号密码登录」——导航/DOM 走 Playwright over CDP，账号/密码/提交全部走
+# 真机 SendInput，拿回 cookie 回写 cookies.value 并重启监听任务。
+# 人脸/短信不自动通过：截图 + 推 QQ + 状态 need_manual + 进冷却（人工处理）。
+COPY utils/password_login.py /app/utils/password_login.py
+RUN python -m py_compile /app/utils/password_login.py /app/XianyuAutoAsync.py \
+    && cd /app \
+    && python -c "from utils.password_login import (should_attempt, config, run_password_login, password_login_refresh, write_back, note_refresh_failure, note_refresh_success, MAX_LOGIN_ATTEMPTS, SEL_ID, SEL_PWD); assert callable(run_password_login) and MAX_LOGIN_ATTEMPTS == 3 and SEL_ID[0] == '#fm-login-id' and SEL_PWD[0] == '#fm-login-password'" \
+    && grep -q "def password_login_refresh" /app/utils/password_login.py \
+    && grep -q "from utils.password_login import password_login_refresh" /app/XianyuAutoAsync.py \
+    && grep -q "from utils.password_login import note_refresh_failure" /app/XianyuAutoAsync.py \
+    && grep -q "from utils.password_login import note_refresh_success" /app/XianyuAutoAsync.py \
+    && echo "overlay(w6): 密码登录编排 OK"
+
+# ── W7（2026-10-10）：发布链路（类目识别 + 账号真实地址 + 发布本体）────────────
+# 新增 utils/item_publish.py：recommend_category / get_default_location / publish_item。
+# 三个 mtop 接口 + payload 字段名逐字照抄 goofish-cli；写操作走 utils.write_guard.acquire_write；
+# 命中风控不重试（交路线 C / W9 真机兜底）；publish_dry_run 默认 true。
+# 仅在本文件**末尾追加**（不改动上方任何行），避免与并发构建互相覆盖。
+COPY utils/item_publish.py /app/utils/item_publish.py
+RUN python -m py_compile /app/utils/item_publish.py \
+    && grep -q "mtop.idle.pc.idleitem.publish" /app/utils/item_publish.py \
+    && grep -q "def acquire_write" /app/utils/write_guard.py \
+    && echo "overlay(w7): item_publish OK"
+
+# ── W9（2026-10-10）：真机全流程兜底（VM101 浏览器完成发布 / 下架）────────────
+# 新增 utils/real_machine_ops.py：browser_publish / browser_delete —— CDP 连 VM101
+# 常驻 Chrome，导航/DOM/取坐标/注入 cookie 走 CDP，**关键操作一律走 driver 的
+# 真机 SendInput**（move/click/type/key），图片上传走 CDP DOM.setFileInputFiles。
+# 同时在 W7/W8 的 L1 失败处加了 L3 钩子（默认关闭，system_settings
+# .real_machine_fallback 显式打开才自动兜底）。
+# 仅在本文件**末尾追加**（不改动上方任何行），避免与并发构建互相覆盖。
+COPY utils/real_machine_ops.py /app/utils/real_machine_ops.py
+RUN python -m py_compile /app/utils/real_machine_ops.py /app/utils/item_publish.py /app/utils/item_delete.py \
+    && grep -q "def browser_publish" /app/utils/real_machine_ops.py \
+    && grep -q "def browser_delete" /app/utils/real_machine_ops.py \
+    && grep -q "DOM.setFileInputFiles" /app/utils/real_machine_ops.py \
+    && grep -q "def l3_browser_publish" /app/utils/item_publish.py \
+    && grep -q "def l3_browser_delete" /app/utils/item_delete.py \
+    && echo "overlay(w9): real_machine_ops + L1 钩子 OK"
+
+# ── W10（2026-10-10）：商品自动化编排（白名单通道 + run 记录 + 状态机）─────────
+# 覆盖 app/product_automation.py（该文件来自上游镜像，overlay 此前未改过，
+# 不 COPY 就改不到）。新增内容：
+#   - schema 迁移（ALTER TABLE，幂等）：product_materials.auto_approved /
+#     auto_approved_at、product_delete_rules.auto_execute，默认全 0
+#     → 迁移后旧行「默认只有人工能触发」
+#   - 状态机：draft → ready → publishing → published / failed（失败不自动重试）
+#   - execute_publish / execute_delete_rule：确认令牌 或 白名单两条入口
+#   - ConfirmTokenStore：一次性确认令牌，TTL 300s，内存 dict，不落库
+#   - run_auto_cycle：定时循环，只处理白名单条目，非白名单跳过并记原因
+#     （总开关 system_settings.product_auto_enabled 默认关；
+#      间隔 product_auto_interval 默认 3600s，下限 600s）
+# 仅在本文件**末尾追加**（不改动上方任何行），避免与并发构建互相覆盖。
+COPY app/product_automation.py /app/app/product_automation.py
+RUN python -m py_compile /app/app/product_automation.py \
+    && grep -q "def execute_publish" /app/app/product_automation.py \
+    && grep -q "def execute_delete_rule" /app/app/product_automation.py \
+    && grep -q "def run_auto_cycle" /app/app/product_automation.py \
+    && grep -q "class ConfirmTokenStore" /app/app/product_automation.py \
+    && grep -q "auto_approved INTEGER DEFAULT 0" /app/app/product_automation.py \
+    && grep -q "auto_execute INTEGER DEFAULT 0" /app/app/product_automation.py \
+    && echo "overlay(w10): product_automation 编排 OK"
+
+# ── W11（2026-10-10）：路由层（确认令牌 / 密码登录 / 写限流状态）───────────────
+# 覆盖 app/reply_server.py（该文件来自上游镜像，overlay 此前未 COPY 过，
+# 不 COPY 就改不到）。新增内容：
+#   - 6 条商品自动化确认路由（prepare -> 一次性令牌 -> execute + 白名单开关）
+#   - POST /password-login + GET /password-login/check/{session_id} +
+#     POST /password-login/reset-cooldown（后台线程跑 W6 的 run_password_login）
+#   - GET /write-guard/status（只读，不消耗令牌）
+# 仅在本文件**末尾追加**（不改动上方任何行），避免与并发构建互相覆盖。
+COPY app/reply_server.py /app/app/reply_server.py
+RUN python -m py_compile /app/app/reply_server.py \
+    && grep -q "publish/prepare" /app/app/reply_server.py \
+    && grep -q "delete-rules/{rule_id}/execute/prepare" /app/app/reply_server.py \
+    && grep -q "/password-login/check/{session_id}" /app/app/reply_server.py \
+    && grep -q "/write-guard/status" /app/app/reply_server.py \
+    && grep -q "ConfirmTokenError" /app/app/reply_server.py \
+    && echo "overlay(w11): 路由层 OK"
+
+# ── W15（2026-10-10）：三期自检收口（导入级断言 + 前端产物正向断言）─────────────
+# 背景：三期（W4–W14）新增 5 个模块（write_guard / password_login / item_publish /
+# item_delete / real_machine_ops）、改动 6 个 .py + 3 个前端文件。上方 COPY 与
+# py_compile 已逐条覆盖全部新增/改动文件（W15 卡逐文件核对过 md5），但 py_compile
+# 只验语法 —— 模块级 import 失败（缺依赖 / 循环导入 / 符号写错）照样能构建通过，
+# 容器起来才 traceback。这里补两道缺口：
+#   1) 把三期涉及的模块整体 import 一遍并抽查对外符号；
+#   2) 前端产物必须含 W12/W13/W14 的新标记（COPY 是合并语义，产物没更新会静默留旧）。
+# 注意：不 import app.product_automation / app.db_manager —— 它们 import 期会触发
+# 幂等 DB 迁移，会把运行时数据写进构建层；这两个文件仍只做 py_compile + grep。
+RUN cd /app \
+    && python -c "import importlib; [importlib.import_module(m) for m in ('utils.write_guard','utils.risk_control','utils.item_polish','utils.item_delete','utils.item_publish','utils.password_login','utils.real_machine_ops','utils.image_uploader','utils.slider_route_c','utils.item_search','utils.captcha_recognition','app.config')]" \
+    && python -c "from utils import write_guard as w; assert hasattr(w,'acquire_write') and hasattr(w,'WriteRateLimited')" \
+    && python -c "from utils import risk_control as r; assert hasattr(r,'AccountGuard') and hasattr(r,'RiskControlRegistry')" \
+    && python -c "from utils import real_machine_ops as m; assert hasattr(m,'browser_publish') and hasattr(m,'browser_delete')" \
+    && python -c "from utils import item_publish as p; assert callable(p.publish_item) and callable(p.recommend_category) and callable(p.get_default_location) and callable(p.l3_browser_publish)" \
+    && python -c "from utils import item_delete as d; assert callable(d.delete_item) and callable(d.l3_browser_delete)" \
+    && python -c "from utils import password_login as l; assert callable(l.run_password_login) and callable(l.should_attempt) and l.MAX_LOGIN_ATTEMPTS == 3" \
+    && grep -q "from utils.write_guard import" /app/utils/item_polish.py \
+    && echo "overlay(w15): 三期导入级自检 OK" \
+    && ( for s in 写操作限流 账号密码自动登录 允许自动发布 允许自动执行 发布到闲鱼 执行删除 confirm-dialog; do grep -rq "$s" /app/static || { echo "overlay(w15): ✗ 前端产物缺标记 $s"; exit 1; }; done ) \
+    && echo "overlay(w15): 前端产物含 W12/W13/W14 新标记"

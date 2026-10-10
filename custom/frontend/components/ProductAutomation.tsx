@@ -12,6 +12,7 @@ import {
   RefreshCw,
   Save,
   Search,
+  Send,
   ShieldCheck,
   Trash2,
   Workflow,
@@ -28,6 +29,8 @@ import {
 } from '../types';
 import {
   compensateProductCards,
+  confirmDeleteExecute,
+  confirmPublish,
   deleteProductDeleteRule,
   deleteProductFilterRule,
   deleteProductMaterial,
@@ -36,16 +39,23 @@ import {
   getProductDeleteRules,
   getProductFilterRules,
   getProductMaterials,
+  prepareDeleteExecute,
+  preparePublish,
   previewProductDeleteRule,
   repairProductShortLinks,
   repairPublishedProductIds,
   runProductFilterRule,
   saveProductDeleteRule,
   saveProductFilterRule,
+  setDeleteRuleAutoExecute,
+  setMaterialAutoApprove,
   updateProductMaterial,
+  DeleteExecutePrepareResult,
+  PublishPrepareResult,
 } from '../services/api';
 import { confirmAction, notify } from '../services/feedback';
 import {
+  ConfirmDialog,
   EmptyState,
   NoticeBanner,
   PageHeader,
@@ -111,7 +121,45 @@ const taskNames: Record<string, string> = {
   published_id_repair: '商品 ID 回写',
   short_link_repair: '链接修复',
   card_compensation: '卡券补偿',
+  // W14 新增：后端 `execute_publish` 落的 task_type 是 `publish_execute`，
+  // `execute_delete_rule` 落的是 `delete_execute`；两个 auto_* 是定时循环落的。
+  publish: '商品发布',
+  publish_execute: '商品发布',
+  delete_execute: '下架执行',
+  auto_publish: '自动发布',
+  auto_delete: '自动下架',
 };
+
+/** W14：`publish_status` → 中文名 + 配色（`ready` 是本卡新增的可发布档）。 */
+const publishStatusMeta: Record<string, { label: string; className: string }> = {
+  draft: { label: '草稿', className: 'bg-gray-100 text-gray-600' },
+  ready: { label: '待发布', className: 'bg-amber-50 text-amber-700' },
+  publishing: { label: '发布中', className: 'bg-blue-50 text-blue-700' },
+  published: { label: '已发布', className: 'bg-green-50 text-green-700' },
+  failed: { label: '发布失败', className: 'bg-red-50 text-red-600' },
+  deleted: { label: '已下架', className: 'bg-gray-100 text-gray-500' },
+};
+
+const publishStatusOf = (status?: string) => (
+  publishStatusMeta[String(status || '')]
+  || { label: status || '草稿', className: 'bg-gray-100 text-gray-600' }
+);
+
+/** W14：编辑弹窗发布状态下拉的候选项，`ready` 为新增档。 */
+const publishStatusOptions = ['draft', 'ready', 'publishing', 'published', 'failed', 'deleted'];
+
+/** W14：白名单标记。后端 `product_materials.auto_approved` 是 0/1 整数（`list_materials` 原样返回）。 */
+const isAutoApproved = (material: ProductMaterial) => (
+  Number((material as ProductMaterial & { auto_approved?: number | boolean }).auto_approved || 0) === 1
+);
+
+/** W14：后端 `product_delete_rules.auto_execute` 已 bool 化。 */
+const isAutoExecute = (rule: ProductDeleteRule) => (
+  Boolean((rule as ProductDeleteRule & { auto_execute?: boolean }).auto_execute)
+);
+
+/** W14：确认令牌要求输入的「候选商品 ID 后 4 位」。 */
+const tail4 = (itemId: string) => String(itemId || '').slice(-4);
 
 const ProductAutomation: React.FC = () => {
   const [activeTab, setActiveTab] = useState<TabKey>('materials');
@@ -128,6 +176,16 @@ const ProductAutomation: React.FC = () => {
   const [filterForm, setFilterForm] = useState(emptyFilterForm);
   const [deleteForm, setDeleteForm] = useState(emptyDeleteForm);
   const [preview, setPreview] = useState<ProductDeletePreview | null>(null);
+  // W14：发布二次确认（prepare 的返回 + 目标素材），摘要加载完成前弹窗不出现 → 「发布」按钮不会误点
+  const [publishPreview, setPublishPreview] = useState<{
+    material: ProductMaterial;
+    prepared: PublishPrepareResult;
+  } | null>(null);
+  // W14：真删除二次确认（候选列表 + 一次性确认令牌）
+  const [deleteExecutePreview, setDeleteExecutePreview] = useState<{
+    rule: ProductDeleteRule;
+    prepared: DeleteExecutePrepareResult;
+  } | null>(null);
 
   const accountNames = useMemo(
     () => new Map(accounts.map((account) => [
@@ -368,6 +426,117 @@ const ProductAutomation: React.FC = () => {
     }
   };
 
+  // ------------------------------------------------------------------
+  // W14：发布通道（prepare → 确认 → execute）+ 自动发布白名单
+  // ------------------------------------------------------------------
+
+  const openPublishPreview = async (material: ProductMaterial) => {
+    setBusyKey(`publish-prepare-${material.id}`);
+    try {
+      const prepared = await preparePublish(material.id);
+      setPublishPreview({ material, prepared });
+    } catch (error) {
+      notify(`发布预演失败：${(error as Error).message}`, 'error');
+    } finally {
+      setBusyKey('');
+    }
+  };
+
+  const confirmPublishMaterial = async () => {
+    if (!publishPreview) return;
+    const { material, prepared } = publishPreview;
+    setBusyKey(`publish-${material.id}`);
+    try {
+      const result = await confirmPublish(material.id, prepared.confirm_token);
+      if (result.ok) {
+        notify(result.summary || '发布任务已完成', result.dry_run ? 'info' : 'success');
+      } else {
+        notify(result.summary || result.message || '发布失败', 'error');
+      }
+      setPublishPreview(null);
+      await loadAll(false);
+    } catch (error) {
+      notify(`发布失败：${(error as Error).message}`, 'error');
+    } finally {
+      setBusyKey('');
+    }
+  };
+
+  const toggleMaterialAutoApprove = async (material: ProductMaterial) => {
+    const next = !isAutoApproved(material);
+    setBusyKey(`material-auto-${material.id}`);
+    try {
+      const saved = await setMaterialAutoApprove(material.id, next);
+      setMaterials((current) => current.map((item) => (item.id === saved.id ? saved : item)));
+      notify(
+        next
+          ? `素材 #${material.id} 已加入自动发布白名单`
+          : `素材 #${material.id} 已移出自动发布白名单`,
+        'success',
+      );
+    } catch (error) {
+      notify(`白名单更新失败：${(error as Error).message}`, 'error');
+    } finally {
+      setBusyKey('');
+    }
+  };
+
+  // ------------------------------------------------------------------
+  // W14：真删除通道（prepare → 输入候选商品 ID 后 4 位 → execute）+ 自动执行白名单
+  // ------------------------------------------------------------------
+
+  const openDeleteExecute = async (rule: ProductDeleteRule) => {
+    setBusyKey(`delete-execute-prepare-${rule.id}`);
+    try {
+      const prepared = await prepareDeleteExecute(rule.id);
+      // 无候选时 requireText 会退化成空串（= 直接可点），这种确认没有意义，直接不弹
+      if (!prepared.candidates.length) {
+        notify(`计划 #${rule.id} 当前没有候选商品，无需执行删除`, 'warning');
+        return;
+      }
+      setDeleteExecutePreview({ rule, prepared });
+    } catch (error) {
+      notify(`删除执行预演失败：${(error as Error).message}`, 'error');
+    } finally {
+      setBusyKey('');
+    }
+  };
+
+  const confirmDeleteExecuteRule = async () => {
+    if (!deleteExecutePreview) return;
+    const { rule, prepared } = deleteExecutePreview;
+    setBusyKey(`delete-execute-${rule.id}`);
+    try {
+      const result = await confirmDeleteExecute(rule.id, prepared.confirm_token);
+      notify(result.summary || '删除执行完成', result.failed_count ? 'warning' : 'success');
+      setDeleteExecutePreview(null);
+      await loadAll(false);
+    } catch (error) {
+      notify(`删除执行失败：${(error as Error).message}`, 'error');
+    } finally {
+      setBusyKey('');
+    }
+  };
+
+  const toggleDeleteAutoExecute = async (rule: ProductDeleteRule) => {
+    const next = !isAutoExecute(rule);
+    setBusyKey(`delete-auto-${rule.id}`);
+    try {
+      const saved = await setDeleteRuleAutoExecute(rule.id, next);
+      setDeleteRules((current) => current.map((item) => (item.id === saved.id ? saved : item)));
+      notify(
+        next
+          ? `计划 #${rule.id} 已加入自动执行白名单`
+          : `计划 #${rule.id} 已移出自动执行白名单`,
+        'success',
+      );
+    } catch (error) {
+      notify(`白名单更新失败：${(error as Error).message}`, 'error');
+    } finally {
+      setBusyKey('');
+    }
+  };
+
   const runRepair = async (
     key: string,
     action: () => Promise<{ summary: string }>,
@@ -447,7 +616,7 @@ const ProductAutomation: React.FC = () => {
               icon={Archive}
             />
             <div className="overflow-x-auto">
-              <table className="data-table responsive-data-table min-w-[980px] text-sm">
+              <table className="data-table responsive-data-table min-w-[1080px] text-sm">
                 <thead>
                   <tr>
                     <th className="px-4 py-3">素材</th>
@@ -455,6 +624,7 @@ const ProductAutomation: React.FC = () => {
                     <th className="px-4 py-3">来源 / 发布 ID</th>
                     <th className="px-4 py-3">状态</th>
                     <th className="px-4 py-3">发货绑定</th>
+                    <th className="px-4 py-3">自动发布</th>
                     <th className="px-4 py-3 text-right">操作</th>
                   </tr>
                 </thead>
@@ -490,16 +660,29 @@ const ProductAutomation: React.FC = () => {
                         </div>
                       </td>
                       <td className="px-4 py-3" data-label="状态">
-                        <span className={`rounded px-2 py-1 text-xs font-bold ${
-                          material.publish_status === 'published'
-                            ? 'bg-green-50 text-green-700'
-                            : 'bg-gray-100 text-gray-600'
-                        }`}>
-                          {material.publish_status === 'published' ? '已发布' : '草稿'}
+                        <span className={`rounded px-2 py-1 text-xs font-bold ${publishStatusOf(material.publish_status).className}`}>
+                          {publishStatusOf(material.publish_status).label}
                         </span>
                       </td>
                       <td className="px-4 py-3 text-xs text-gray-600" data-label="发货绑定">
                         {material.auto_card_id ? `卡券 #${material.auto_card_id}` : '未绑定'}
+                      </td>
+                      <td className="px-4 py-3" data-label="自动发布">
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={isAutoApproved(material)}
+                          aria-label="允许自动发布"
+                          title="允许自动发布：打开后定时任务会把它当作白名单素材自动发布"
+                          disabled={busyKey === `material-auto-${material.id}`}
+                          onClick={() => void toggleMaterialAutoApprove(material)}
+                          className="flex items-center gap-2 text-xs font-bold text-gray-700 disabled:opacity-50"
+                        >
+                          <span className={`relative h-6 w-11 flex-none rounded-full ${isAutoApproved(material) ? 'bg-yellow-400' : 'bg-gray-300'}`}>
+                            <span className={`absolute left-1 top-1 h-4 w-4 rounded-full bg-white transition-transform ${isAutoApproved(material) ? 'translate-x-5' : ''}`} />
+                          </span>
+                          {isAutoApproved(material) ? '已允许' : '未允许'}
+                        </button>
                       </td>
                       <td className="px-4 py-3" data-label="操作">
                         <div className="flex justify-end gap-1">
@@ -514,6 +697,18 @@ const ProductAutomation: React.FC = () => {
                               <ExternalLink className="h-4 w-4" />
                             </a>
                           )}
+                          <button
+                            type="button"
+                            title="发布到闲鱼"
+                            aria-label="发布到闲鱼"
+                            disabled={busyKey === `publish-prepare-${material.id}`}
+                            onClick={() => void openPublishPreview(material)}
+                            className="rounded p-2 text-blue-600 hover:bg-blue-50 disabled:opacity-50"
+                          >
+                            {busyKey === `publish-prepare-${material.id}`
+                              ? <Loader2 className="h-4 w-4 animate-spin" />
+                              : <Send className="h-4 w-4" />}
+                          </button>
                           <button
                             type="button"
                             title="编辑素材"
@@ -722,7 +917,7 @@ const ProductAutomation: React.FC = () => {
         <section className="space-y-5">
           <NoticeBanner
             type="warning"
-            message="当前执行模式固定为 dry-run，只生成候选记录，不会删除闲鱼商品或本地商品。"
+            message="「预演」只生成候选记录，不动闲鱼商品；「执行」会真的下架候选商品（不可逆，需输入候选商品 ID 后 4 位确认）。定时循环只处理「允许自动执行」且计划已启用的白名单。"
           />
 
           <div className="section-panel">
@@ -824,12 +1019,12 @@ const ProductAutomation: React.FC = () => {
           <div className="section-panel">
             <SectionHeader
               title="删除预演计划"
-              description="所有计划均只生成候选结果，需在预演结果中人工核对。"
+              description="「预演」只生成候选结果供人工核对；「执行」会按候选真下架（需二次确认）。"
               actions={<span className="text-xs font-medium text-gray-500">{deleteRules.length} 条</span>}
             />
             <div className="divide-y divide-gray-100">
               {deleteRules.map((rule) => (
-                <div key={rule.id} className="grid gap-4 p-4 lg:grid-cols-[minmax(220px,1fr)_1fr_180px_auto] lg:items-center">
+                <div key={rule.id} className="grid gap-4 p-4 lg:grid-cols-[minmax(200px,1fr)_1fr_150px_160px_auto] lg:items-center">
                 <div>
                   <div className="font-bold text-gray-900">{rule.name}</div>
                   <div className="mt-1 text-xs text-gray-500">{accountNames.get(rule.cookie_id) || rule.cookie_id}</div>
@@ -843,7 +1038,34 @@ const ProductAutomation: React.FC = () => {
                   <span className="rounded bg-amber-50 px-2 py-1 text-xs font-bold text-amber-700">DRY-RUN</span>
                   <div className="mt-2 text-xs text-gray-500">{formatDate(rule.last_run_at)}</div>
                 </div>
+                <div data-label="自动执行">
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={isAutoExecute(rule)}
+                    aria-label="允许自动执行"
+                    title="允许自动执行：打开后定时任务会对该计划的白名单候选真下架（需计划同时处于启用状态）"
+                    disabled={busyKey === `delete-auto-${rule.id}`}
+                    onClick={() => void toggleDeleteAutoExecute(rule)}
+                    className="flex items-center gap-2 text-xs font-bold text-gray-700 disabled:opacity-50"
+                  >
+                    <span className={`relative h-6 w-11 flex-none rounded-full ${isAutoExecute(rule) ? 'bg-yellow-400' : 'bg-gray-300'}`}>
+                      <span className={`absolute left-1 top-1 h-4 w-4 rounded-full bg-white transition-transform ${isAutoExecute(rule) ? 'translate-x-5' : ''}`} />
+                    </span>
+                    {isAutoExecute(rule) ? '已允许' : '未允许'}
+                  </button>
+                </div>
                 <div className="flex justify-end gap-1">
+                  <button
+                    type="button"
+                    title="执行删除（真下架，需输入候选商品 ID 后 4 位）"
+                    aria-label="执行删除"
+                    disabled={busyKey === `delete-execute-prepare-${rule.id}`}
+                    onClick={() => void openDeleteExecute(rule)}
+                    className="rounded p-2 text-red-600 hover:bg-red-50 disabled:opacity-50"
+                  >
+                    {busyKey === `delete-execute-prepare-${rule.id}` ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+                  </button>
                   <button
                     type="button"
                     title="执行预演"
@@ -1013,6 +1235,21 @@ const ProductAutomation: React.FC = () => {
                 />
               </label>
               <label className="text-xs font-bold text-gray-600">
+                发布状态
+                <select
+                  value={editingMaterial.publish_status}
+                  onChange={(event) => setEditingMaterial({ ...editingMaterial, publish_status: event.target.value })}
+                  className="ios-input mt-1.5 w-full rounded-md px-3 py-2.5 text-sm"
+                >
+                  {(publishStatusOptions.includes(editingMaterial.publish_status)
+                    ? publishStatusOptions
+                    : [editingMaterial.publish_status, ...publishStatusOptions]
+                  ).map((status) => (
+                    <option key={status} value={status}>{publishStatusOf(status).label}（{status}）</option>
+                  ))}
+                </select>
+              </label>
+              <label className="text-xs font-bold text-gray-600">
                 已发布商品 ID
                 <input
                   value={editingMaterial.published_item_id}
@@ -1101,6 +1338,108 @@ const ProductAutomation: React.FC = () => {
             </div>
           </div>
         </div>
+      )}
+
+      {publishPreview && (
+        <ConfirmDialog
+          open
+          title="确认发布商品"
+          confirmLabel="确认发布"
+          loading={busyKey === `publish-${publishPreview.material.id}`}
+          onConfirm={() => void confirmPublishMaterial()}
+          onCancel={() => setPublishPreview(null)}
+        >
+          <div className="space-y-3 text-sm">
+            <div className="flex gap-3">
+              <div className="h-16 w-16 flex-none overflow-hidden rounded bg-gray-100">
+                {publishPreview.material.images[0] ? (
+                  <img
+                    src={normalizeImage(publishPreview.material.images[0])}
+                    alt=""
+                    className="h-full w-full object-cover"
+                    referrerPolicy="no-referrer"
+                  />
+                ) : <Archive className="m-4 h-8 w-8 text-gray-400" />}
+              </div>
+              <div className="min-w-0">
+                <div className="font-bold text-gray-900">{publishPreview.material.title}</div>
+                <div className="mt-1 text-xs text-gray-500">
+                  {publishPreview.material.price == null ? '价格未设置' : `¥${publishPreview.material.price}`}
+                </div>
+              </div>
+            </div>
+            <dl className="grid gap-1.5 text-xs">
+              <div className="flex justify-between gap-3">
+                <dt className="text-gray-500">识别类目</dt>
+                <dd className="font-medium text-gray-800">{publishPreview.material.category || '未识别'}</dd>
+              </div>
+              <div className="flex justify-between gap-3">
+                <dt className="text-gray-500">发布地址</dt>
+                <dd className="font-medium text-gray-800">
+                  {accounts.find((item) => item.id === publishPreview.material.cookie_id)?.location || '未获取'}
+                </dd>
+              </div>
+              <div className="flex justify-between gap-3">
+                <dt className="text-gray-500">账号</dt>
+                <dd className="font-medium text-gray-800">
+                  {accountNames.get(publishPreview.material.cookie_id) || publishPreview.material.cookie_id}
+                </dd>
+              </div>
+              <div className="flex justify-between gap-3">
+                <dt className="text-gray-500">素材 / 状态</dt>
+                <dd className="font-medium text-gray-800">
+                  #{publishPreview.material.id} · {publishStatusOf(publishPreview.prepared.publish_status).label}
+                </dd>
+              </div>
+            </dl>
+            <div className="rounded bg-gray-50 p-2 text-xs leading-5 text-gray-600" data-testid="publish-summary">
+              后端摘要：{publishPreview.prepared.summary}
+            </div>
+            <p className="text-[11px] leading-4 text-gray-400">
+              发布地址取账号所在地；实际 POI 由后端在发布时按账号默认地址写入，本弹窗不回显任何凭据或地址明细。
+            </p>
+            {publishPreview.prepared.dry_run && (
+              <NoticeBanner
+                type="warning"
+                message="当前 publish_dry_run=true：确认后只组装 payload，不会真的发布到闲鱼。"
+              />
+            )}
+          </div>
+        </ConfirmDialog>
+      )}
+
+      {deleteExecutePreview && (
+        <ConfirmDialog
+          open
+          danger
+          title="确认执行下架"
+          confirmLabel="确认下架"
+          requireText={tail4(deleteExecutePreview.prepared.candidates[0]?.item_id || '')}
+          loading={busyKey === `delete-execute-${deleteExecutePreview.rule.id}`}
+          onConfirm={() => void confirmDeleteExecuteRule()}
+          onCancel={() => setDeleteExecutePreview(null)}
+        >
+          <div className="space-y-3 text-sm">
+            <div className="rounded bg-red-50 p-2 text-xs leading-5 text-red-700" data-testid="delete-execute-summary">
+              {deleteExecutePreview.prepared.summary}
+            </div>
+            <div>
+              <h4 className="text-xs font-bold text-gray-700">
+                候选商品 {deleteExecutePreview.prepared.candidates.length} 件（确认后全部真下架）
+              </h4>
+              <div className="mt-2 max-h-56 divide-y divide-gray-100 overflow-y-auto border-y border-gray-200">
+                {deleteExecutePreview.prepared.candidates.map((item) => (
+                  <div key={item.item_id} className="py-2">
+                    <div className="font-medium text-gray-900">{item.item_title || item.item_id}</div>
+                    <div className="mt-0.5 font-mono text-xs text-gray-500">
+                      ID {item.item_id} · {item.age_days || 0} 天 · {item.reason}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </ConfirmDialog>
       )}
     </div>
   );

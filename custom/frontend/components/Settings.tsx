@@ -4,10 +4,13 @@ import {
   ExternalLink,
   Eye,
   EyeOff,
+  Gauge,
   KeyRound,
+  Lock,
   Mail,
   Megaphone,
   RefreshCw,
+  RotateCcw,
   Save,
   Settings as SettingsIcon,
   ShieldCheck,
@@ -22,14 +25,18 @@ import {
   changePassword,
   createQuickPhrase,
   deleteQuickPhrase,
+  getChatAccounts,
   getQuickPhrases,
   getSystemSettings,
+  getWriteGuardStatus,
+  resetPasswordLoginCooldown,
   sendTestEmail,
   updateQuickPhrase,
   updateSystemSettings,
+  WriteGuardStatus,
 } from '../services/api';
 import { notify } from '../services/feedback';
-import { QuickPhrase, SystemSettings } from '../types';
+import { ChatAccount, QuickPhrase, SystemSettings } from '../types';
 import {
   NoticeBanner,
   PageHeader,
@@ -56,6 +63,18 @@ const toBool = (value: unknown, fallback = false): boolean => {
   }
   if (value === undefined || value === null) return fallback;
   return Boolean(value);
+};
+
+/**
+ * 把输入框里的数值收敛成合法整数。
+ *
+ * 后端的开关/数值一律存成字符串，且面板允许直接输入；空串或非法输入一律回落
+ * 默认值，任何值都不低于 min（速率/阈值/冷却下限均为 1）。避免脏数据把限流关掉。
+ */
+const clampInt = (value: unknown, fallback: number, min = 1): number => {
+  const parsed = parseInt(String(value ?? '').trim(), 10);
+  if (Number.isNaN(parsed)) return fallback;
+  return Math.max(min, parsed);
 };
 
 interface SettingToggleProps {
@@ -173,6 +192,51 @@ const Settings: React.FC = () => {
       notify(`密码修改失败：${(error as Error).message}`);
     } finally {
       setChangingPassword(false);
+    }
+  };
+
+  // 写限流实时额度（只读，来自 GET /write-guard/status，不消耗令牌）
+  const [writeGuard, setWriteGuard] = useState<WriteGuardStatus | null>(null);
+  const [writeGuardLoading, setWriteGuardLoading] = useState(false);
+
+  // 账号密码自动登录：账号下拉。只用 id / 昵称，接口本身不返回任何账号密码字段。
+  const [loginAccounts, setLoginAccounts] = useState<ChatAccount[]>([]);
+  const [cooldownAccountId, setCooldownAccountId] = useState('');
+  const [resettingCooldown, setResettingCooldown] = useState(false);
+
+  const loadWriteGuard = () => {
+    setWriteGuardLoading(true);
+    getWriteGuardStatus()
+      .then(setWriteGuard)
+      .catch(() => setWriteGuard(null))
+      .finally(() => setWriteGuardLoading(false));
+  };
+
+  useEffect(() => {
+    getChatAccounts()
+      .then((list) => {
+        setLoginAccounts(list);
+        setCooldownAccountId((prev: string) => prev || list[0]?.accountId || '');
+      })
+      .catch(() => setLoginAccounts([]));
+    loadWriteGuard();
+  }, []);
+
+  const handleResetCooldown = async () => {
+    if (!cooldownAccountId) {
+      notify('请先选择账号');
+      return;
+    }
+    setResettingCooldown(true);
+    try {
+      const snapshot = await resetPasswordLoginCooldown(cooldownAccountId);
+      notify(
+        `已重置：连续失败 ${snapshot.fail_count} 次，冷却剩余 ${snapshot.cooldown_remaining_s} 秒`,
+      );
+    } catch (error) {
+      notify(`重置失败：${(error as Error).message}`, 'error');
+    } finally {
+      setResettingCooldown(false);
     }
   };
 
@@ -429,6 +493,149 @@ const Settings: React.FC = () => {
                 />
                 <span className="mt-1 block text-xs text-gray-500">闲鱼接口通常每页返回 20 件商品。</span>
               </label>
+            </div>
+          </section>
+
+          <section className="section-panel">
+            <SectionHeader
+              title="写操作限流"
+              description="限制发布、下架、擦亮等会改动闲鱼数据的写操作频率。"
+              icon={Gauge}
+            />
+            <SettingToggle
+              title="启用写操作限流"
+              description="关闭后写操作不再限流，账号被平台风控的概率会显著升高。"
+              checked={toBool(settings.write_rate_enabled, true)}
+              onChange={() => setSettings({
+                ...settings,
+                write_rate_enabled: !toBool(settings.write_rate_enabled, true),
+              })}
+            />
+            <div className="grid gap-4 p-4 sm:grid-cols-2">
+              <label>
+                <span className="field-label">每分钟写操作上限</span>
+                <input
+                  type="number"
+                  value={clampInt(settings.write_rate_per_minute, 1, 1)}
+                  onChange={(event) => setSettings({
+                    ...settings,
+                    write_rate_per_minute: clampInt(event.target.value, 1, 1),
+                  })}
+                  className="ios-input w-full rounded-md px-3 py-2.5"
+                  min="1"
+                />
+                <span className="mt-1 block text-xs text-gray-500">最小 1，默认 1。</span>
+              </label>
+              <label>
+                <span className="field-label">每日写操作上限</span>
+                <input
+                  type="number"
+                  value={clampInt(settings.write_daily_limit, 20, 1)}
+                  onChange={(event) => setSettings({
+                    ...settings,
+                    write_daily_limit: clampInt(event.target.value, 20, 1),
+                  })}
+                  className="ios-input w-full rounded-md px-3 py-2.5"
+                  min="1"
+                />
+                <span className="mt-1 block text-xs text-gray-500">最小 1，默认 20。</span>
+              </label>
+            </div>
+            <p className="px-4 pb-3 text-xs leading-5 text-gray-500">
+              写操作指发布、下架、擦亮等会改变闲鱼数据的调用。
+              平台建议单账号 1 次/分钟、每日不超过 20 次。调高会显著增加账号风控风险。
+            </p>
+            <div className="flex flex-wrap items-center gap-3 border-t border-gray-100 px-4 py-3">
+              <span className="text-xs text-gray-500">
+                当前额度：本分钟 {writeGuard?.per_minute_used ?? '—'}/{writeGuard?.per_minute_limit ?? '—'}，
+                今日 {writeGuard?.daily_used ?? '—'}/{writeGuard?.daily_limit ?? '—'}
+              </span>
+              <button
+                type="button"
+                onClick={loadWriteGuard}
+                disabled={writeGuardLoading}
+                className="ios-btn-secondary flex items-center gap-2 rounded-md px-3 py-1.5 text-xs disabled:opacity-60"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${writeGuardLoading ? 'animate-spin' : ''}`} />
+                刷新额度
+              </button>
+            </div>
+          </section>
+
+          <section className="section-panel">
+            <SectionHeader
+              title="账号密码自动登录"
+              description="免密刷新连续失败达到阈值后，自动用账号密码经真机登录一次。"
+              icon={Lock}
+            />
+            <SettingToggle
+              title="启用账号密码自动登录"
+              description="关闭后免密刷新失败只会标记为需要重新登录，不会自动尝试。"
+              checked={toBool(settings.pwd_login_enabled, true)}
+              onChange={() => setSettings({
+                ...settings,
+                pwd_login_enabled: !toBool(settings.pwd_login_enabled, true),
+              })}
+            />
+            <div className="grid gap-4 p-4 sm:grid-cols-2">
+              <label>
+                <span className="field-label">连续失败阈值</span>
+                <input
+                  type="number"
+                  value={clampInt(settings.pwd_login_fail_threshold, 5, 1)}
+                  onChange={(event) => setSettings({
+                    ...settings,
+                    pwd_login_fail_threshold: clampInt(event.target.value, 5, 1),
+                  })}
+                  className="ios-input w-full rounded-md px-3 py-2.5"
+                  min="1"
+                />
+                <span className="mt-1 block text-xs text-gray-500">最小 1，默认 5。</span>
+              </label>
+              <label>
+                <span className="field-label">冷却（分钟）</span>
+                <input
+                  type="number"
+                  value={clampInt(settings.pwd_login_cooldown_minutes, 30, 1)}
+                  onChange={(event) => setSettings({
+                    ...settings,
+                    pwd_login_cooldown_minutes: clampInt(event.target.value, 30, 1),
+                  })}
+                  className="ios-input w-full rounded-md px-3 py-2.5"
+                  min="1"
+                />
+                <span className="mt-1 block text-xs text-gray-500">最小 1，默认 30。</span>
+              </label>
+            </div>
+            <p className="px-4 pb-3 text-xs leading-5 text-gray-500">
+              免密刷新连续失败达到阈值后，自动用账号密码经真机登录一次；冷却期内不重试。
+              出现人脸/短信验证时只能人工处理，会推 QQ 通知。
+            </p>
+            <div className="flex flex-col gap-2 border-t border-gray-100 p-4 sm:flex-row sm:items-end">
+              <label className="min-w-0 flex-1">
+                <span className="field-label">账号</span>
+                <select
+                  value={cooldownAccountId}
+                  onChange={(event) => setCooldownAccountId(event.target.value)}
+                  className="ios-input w-full rounded-md px-3 py-2.5"
+                >
+                  {loginAccounts.length === 0 && <option value="">（暂无账号）</option>}
+                  {loginAccounts.map((account) => (
+                    <option key={account.accountId} value={account.accountId}>
+                      {account.displayName}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                onClick={() => void handleResetCooldown()}
+                disabled={resettingCooldown || !cooldownAccountId}
+                className="ios-btn-secondary flex items-center justify-center gap-2 whitespace-nowrap rounded-md px-4 py-2.5 text-sm disabled:opacity-60"
+              >
+                <RotateCcw className={`h-4 w-4 ${resettingCooldown ? 'animate-spin' : ''}`} />
+                {resettingCooldown ? '重置中' : '重置失败计数与冷却'}
+              </button>
             </div>
           </section>
 

@@ -31,6 +31,13 @@
 #   {"action":"move","x":..,"y":..}
 #   {"action":"click","x":..,"y":..,"button":"left"}
 #   {"action":"drag", ...}
+#   {"action":"type","text":".."}             -> type the whole string with SendInput
+#                                               (KEYEVENTF_UNICODE, char by char)
+#                                               -> {typed:<char count>,us:<elapsed us>}
+#   {"action":"key","vk":<int>,"hold_ms":0}   -> press a virtual key and release it
+#                                               (hold_ms>0 sleeps between down/up)
+#   {"action":"keydown","vk":<int>}           -> press and hold (for key combos)
+#   {"action":"keyup","vk":<int>}             -> release a held key
 #   {"action":"hide"}                        -> hide own console window
 #   {"action":"shutdown"}
 # drag fields:
@@ -43,6 +50,8 @@
 #
 # SECURITY: the unlock password is read from disk, typed with SendInput and is
 # NEVER written to the log, NEVER returned in a response and NEVER echoed.
+# The same rule applies to the 'type' action: the text is typed with SendInput
+# and is NEVER written to the log, NEVER returned in a response and NEVER echoed.
 
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
@@ -476,6 +485,49 @@ function DoUnlock($cmd) {
     } }
 }
 
+function DoType($cmd) {
+    $text = ''
+    if ($cmd.text) { $text = [string]$cmd.text }
+    $t0 = NowUs
+    # SECURITY: never log/echo/return this value.
+    [WinInput]::TypeText($text) | Out-Null
+    $t1 = NowUs
+    return @{ ok = $true; data = @{
+        action = 'type'
+        typed = $text.Length
+        us = ($t1 - $t0)
+        qpc_us = $t1
+    } }
+}
+
+function DoKey($cmd) {
+    $act = 'key'
+    if ($cmd.action) { $act = [string]$cmd.action }
+    $vk = 0
+    if ($cmd.vk) { $vk = [int]$cmd.vk }
+    $holdMs = 0
+    if ($cmd.hold_ms) { $holdMs = [int]$cmd.hold_ms }
+    $t0 = NowUs
+    if ($act -eq 'keydown') {
+        [WinInput]::KeyVk([uint32]$vk, $false) | Out-Null
+    } elseif ($act -eq 'keyup') {
+        [WinInput]::KeyVk([uint32]$vk, $true) | Out-Null
+    } elseif ($holdMs -gt 0) {
+        [WinInput]::KeyVk([uint32]$vk, $false) | Out-Null
+        Start-Sleep -Milliseconds $holdMs
+        [WinInput]::KeyVk([uint32]$vk, $true) | Out-Null
+    } else {
+        [WinInput]::TapVk([uint32]$vk) | Out-Null
+    }
+    $t1 = NowUs
+    return @{ ok = $true; data = @{
+        action = $act
+        vk = $vk
+        us = ($t1 - $t0)
+        qpc_us = $t1
+    } }
+}
+
 while ($true) {
     $ctx = $null
     try { $ctx = $listener.GetContext() } catch { Log ("GETCTX_ERR " + $_.Exception.Message); break }
@@ -557,6 +609,10 @@ while ($true) {
                 Respond $ctx @{ ok = $true; data = @{ action = 'click'; cursor = [WinInput]::Cursor() } }
             }
             'drag' { Respond $ctx (DoDrag $cmd) }
+            'type' { Respond $ctx (DoType $cmd) }
+            'key' { Respond $ctx (DoKey $cmd) }
+            'keydown' { Respond $ctx (DoKey $cmd) }
+            'keyup' { Respond $ctx (DoKey $cmd) }
             'hide' { [WinInput]::HideConsole(); Respond $ctx @{ ok = $true; data = @{ action = 'hide' } } }
             'shutdown' { Respond $ctx @{ ok = $true; data = @{ action = 'shutdown' } }; $listener.Stop(); exit 0 }
             default { Respond $ctx @{ ok = $false; error = ("unknown action: " + $act) } }

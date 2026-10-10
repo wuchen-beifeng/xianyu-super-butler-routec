@@ -2939,23 +2939,39 @@ class XianyuLive:
             await self.send_token_refresh_notification(f"Cookie更新失败: {str(e)}", "cookie_update_failed")
 
     async def _try_password_login_refresh(self, trigger_reason: str = "令牌/Session过期"):
-        """密码登录刷新 —— v2（T7）已下线。
+        """密码登录刷新 —— 三期（W6）恢复：CDP 导航 + VM101 真机 SendInput。
 
-        二期只保留**扫码登录**：账号密码登录依赖的容器内浏览器自动化已整体删除，
-        密码登录无法再执行。
-        这里保留方法签名与返回值契约（False = 未刷新），调用方据此打上
-        `needs_relogin` 终态并提示用户重新扫码。
+        实现见 `utils/password_login.py`：
+          * 导航 / DOM / cookie 读写走 Playwright over CDP（VM101 常驻 Chrome）；
+          * 账号、密码、提交全部走真机 `SendInput`（容器内 CDP 合成事件通过率 0）；
+          * 滑块交给同一套 SendInput 拖动原语（不调路线 C 的 solver —— 它会清 cookie
+            重新导航，会把正在进行的登录抹掉）。
+
+        触发门（总开关 / 免密刷新连续失败阈值 / 冷却 / 连续失败 3 次停手）在
+        `password_login.should_attempt()` 里统一把关，本方法只是入口，未达阈值时
+        直接返回 False（等价于旧行为：调用方打 `needs_relogin`）。
 
         Args:
             trigger_reason: 触发原因，仅用于日志
+        Returns:
+            bool: 是否成功拿到新 cookie 并回写
         """
-        logger.warning(
-            f"【{self.cookie_id}】检测到{trigger_reason}，但密码登录刷新已下线"
-            f"（v2 只保留扫码登录），需要重新扫码登录"
-        )
-        log_captcha_event(self.cookie_id, f"{trigger_reason}：密码登录刷新已下线", None,
-                          "v2 只保留扫码登录，请重新扫码")
-        return False
+        try:
+            from utils.password_login import password_login_refresh
+        except Exception as e:
+            logger.error(f"【{self.cookie_id}】密码登录模块不可用: {self._safe_str(e)}")
+            return False
+        log_captcha_event(self.cookie_id, f"{trigger_reason}：尝试密码登录", None, "")
+        try:
+            ok = await password_login_refresh(self.cookie_id, trigger_reason=trigger_reason)
+        except Exception as e:
+            logger.error(f"【{self.cookie_id}】密码登录刷新异常: {self._safe_str(e)}")
+            return False
+        if ok:
+            log_captcha_event(self.cookie_id, f"{trigger_reason}：密码登录成功", True, "")
+        else:
+            log_captcha_event(self.cookie_id, f"{trigger_reason}：密码登录未成功", False, "")
+        return bool(ok)
 
     async def _verify_cookie_validity(self) -> dict:
         """验证Cookie的有效性，通过实际调用API测试
@@ -3094,7 +3110,7 @@ class XianyuLive:
                 # 分析上传结果
                 if upload_result:
                     # 上传成功，Cookie有效
-                    logger.info(f"【{self.cookie_id}】✅ 图片上传API验证通过: 上传成功 ({upload_result[:50]}...)")
+                    logger.info(f"【{self.cookie_id}】✅ 图片上传API验证通过: 上传成功 ({upload_result['url'][:50]}...)")
                     result['image_api'] = True
                     result['details'].append("图片上传API: 通过验证")
                 else:
@@ -4426,7 +4442,8 @@ class XianyuLive:
                     uploader = ImageUploader(self.cookies_str)
 
                     async with uploader:
-                        cdn_url = await uploader.upload_image(local_image_path)
+                        upload_result = await uploader.upload_image(local_image_path)
+                        cdn_url = upload_result["url"] if upload_result else None
                         if cdn_url:
                             logger.info(f"图片上传成功，CDN URL: {cdn_url}")
                             # 更新数据库中的图片URL为CDN URL
@@ -7759,6 +7776,13 @@ class XianyuLive:
                 if success:
                     self.last_cookie_refresh_time = current_time
                     logger.info(f"【{self.cookie_id}】Cookie刷新任务完成，心跳已恢复")
+
+                    # 免密刷新成功 = 计数清零（密码登录的「成功一次即清零」落点）
+                    try:
+                        from utils.password_login import note_refresh_success
+                        note_refresh_success(self.cookie_id)
+                    except Exception as _pl_err:
+                        logger.warning(f"【{self.cookie_id}】密码登录计数清零失败: {self._safe_str(_pl_err)}")
                     
                     # 刷新成功后，验证Cookie有效性
                     logger.info(f"【{self.cookie_id}】开始验证刷新后的Cookie有效性...")
@@ -7792,6 +7816,25 @@ class XianyuLive:
                     logger.warning(f"【{self.cookie_id}】Cookie刷新任务失败")
                     # 即使失败也要更新时间，避免频繁重试
                     self.last_cookie_refresh_time = current_time
+
+                    # 免密刷新失败 = 计数 +1；连续失败达到阈值 → 接上密码登录（兜底）
+                    try:
+                        from utils.password_login import note_refresh_failure
+                        _fail_count, _reached = note_refresh_failure(self.cookie_id)
+                        if _reached:
+                            logger.warning(
+                                f"【{self.cookie_id}】免密刷新连续失败 {_fail_count} 次，"
+                                f"触发密码登录兜底..."
+                            )
+                            _pl_ok = await self._try_password_login_refresh(
+                                f"免密刷新连续失败 {_fail_count} 次"
+                            )
+                            if _pl_ok:
+                                logger.info(f"【{self.cookie_id}】密码登录兜底成功，Cookie 已更新")
+                            else:
+                                logger.warning(f"【{self.cookie_id}】密码登录兜底未成功")
+                    except Exception as _pl_err:
+                        logger.error(f"【{self.cookie_id}】密码登录兜底异常: {self._safe_str(_pl_err)}")
 
             except asyncio.TimeoutError:
                 # 超时也要更新时间，避免频繁重试
@@ -9551,7 +9594,8 @@ class XianyuLive:
                                             uploader = ImageUploader(self.cookies_str)
                                             
                                             async with uploader:
-                                                cdn_url = await uploader.upload_image(local_image_path)
+                                                upload_result = await uploader.upload_image(local_image_path)
+                                                cdn_url = upload_result["url"] if upload_result else None
                                                 if cdn_url:
                                                     logger.info(f"【{self.cookie_id}】默认回复图片上传成功，CDN URL: {cdn_url}")
                                                     final_image_url = cdn_url
@@ -11252,7 +11296,8 @@ class XianyuLive:
                     uploader = ImageUploader(self.cookies_str)
 
                     async with uploader:
-                        cdn_url = await uploader.upload_image(local_image_path)
+                        upload_result = await uploader.upload_image(local_image_path)
+                        cdn_url = upload_result["url"] if upload_result else None
                         if cdn_url:
                             logger.info(f"【{self.cookie_id}】图片上传成功，CDN URL: {cdn_url}")
                             image_url = cdn_url
@@ -11365,8 +11410,9 @@ class XianyuLive:
             uploader = ImageUploader(self.cookies_str)
 
             async with uploader:
-                image_url = await uploader.upload_image(image_path)
+                upload_result = await uploader.upload_image(image_path)
 
+            image_url = upload_result["url"] if upload_result else None
             if image_url:
                 # 获取图片信息
                 try:

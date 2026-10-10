@@ -1092,6 +1092,13 @@ class DBManager:
                     )
                     logger.info(f"数据库迁移完成：添加{column_name}列")
 
+            # 发布地址缓存（W7 发布链路）：首次发布时由 mtop.taobao.idle.local.poi.get
+            # 取回账号默认地址并写入；列非空即视为已覆盖（面板覆盖同此语义）。
+            if 'publish_addr_json' not in cookie_columns:
+                logger.info("添加cookies表的publish_addr_json列...")
+                cursor.execute("ALTER TABLE cookies ADD COLUMN publish_addr_json TEXT DEFAULT ''")
+                logger.info("数据库迁移完成：添加publish_addr_json列")
+
             cursor.execute("PRAGMA table_info(ai_reply_settings)")
             ai_setting_columns = [column[1] for column in cursor.fetchall()]
             ai_context_columns = {
@@ -2272,6 +2279,51 @@ class DBManager:
             except Exception as e:
                 logger.error(f"根据ID获取Cookie失败: {e}")
                 return None
+
+    # -------------------- 发布地址缓存（W7 发布链路） --------------------
+    def get_publish_addr(self, cookie_id: str) -> Optional[Dict[str, Any]]:
+        """读取账号缓存的默认发布地址（``cookies.publish_addr_json``）。
+
+        Returns:
+            解析后的 dict；无缓存 / 空值 / 解析失败一律返回 ``None``
+            （``None`` 表示"还没缓存过，需要调 local.poi.get"）。
+        """
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor, "SELECT publish_addr_json FROM cookies WHERE id = ?", (cookie_id,)
+                )
+                row = cursor.fetchone()
+                if not row or not row[0]:
+                    return None
+                parsed = json.loads(row[0])
+                return parsed if isinstance(parsed, dict) and parsed else None
+            except Exception as e:
+                logger.error(f"读取发布地址缓存失败: {e}")
+                return None
+
+    def set_publish_addr(self, cookie_id: str, addr: Dict[str, Any]) -> bool:
+        """写入账号的默认发布地址缓存（``cookies.publish_addr_json``）。
+
+        写入非空值即视为"已覆盖"；此后 :func:`utils.item_publish.get_default_location`
+        直接读缓存，不再调 local.poi.get。
+        """
+        with self.lock:
+            try:
+                payload = json.dumps(addr or {}, ensure_ascii=False, separators=(",", ":"))
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    "UPDATE cookies SET publish_addr_json = ? WHERE id = ?",
+                    (payload, cookie_id),
+                )
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"写入发布地址缓存失败: {e}")
+                self.conn.rollback()
+                return False
 
     def get_cookie_details(self, cookie_id: str) -> Optional[Dict[str, any]]:
         """获取Cookie的账号设置和公开资料。"""

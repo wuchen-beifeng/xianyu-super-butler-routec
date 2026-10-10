@@ -8,7 +8,7 @@
 > （阿里 nc 不接受 CDP 派发的合成鼠标事件）。本仓库保留上游的扫码登录、发货、AI 回复等全部能力，
 > 只替换滑块这一环。
 
-- 预构建镜像（公开）：`docker pull wuchen986/xianyu-super-butler:latest` —— 含本仓库全部改动，免本地构建
+- 预构建镜像（公开）：`docker pull wuchen986/xianyu-super-butler:latest` —— 免本地构建（见 §3.1 方式 A）
 - 许可证：**AGPL-3.0**（与上游一致，见 [`LICENSE`](LICENSE)）
 - 上游基线提交：`697bdb4f750311d20e3fe46d16666d464eda4903`（2026-10-08）
 
@@ -58,9 +58,17 @@
 | **QQ 通知** | 新增 `qq` 渠道类型（NapCat / OneBot v11），滑块序列耗尽走既有 `captcha_manual` 事件 |
 | **构建** | 叠加构建（overlay）：复用上游预构建镜像的全部重层，只加薄薄一层 COPY；前端用 multi-stage `node:20-alpine` 现场构建 |
 | **发布** | 叠加构建产物已推到 Docker Hub 公开仓库 `wuchen986/xianyu-super-butler`（发布镜像**不含** `slider_routec/token`，密钥一律运行时挂载） |
+| **商品发布（三期 W7/W9）** | 新增 `utils/item_publish.py`（类目识别 + 账号默认地址 + 发布本体，L1 协议 mtop）；`app/product_automation.py` 加白名单通道 / run 记录 / 状态机 / 一次性确认令牌；前端素材行「发布」按钮 |
+| **商品下架 / 删除（三期 W8/W9）** | 新增 `utils/item_delete.py`（`com.taobao.idle.item.delete` **v1.1**）；前端删除规则「执行」按钮。**实测语义 = 真删除，不可逆** |
+| **账号密码自动登录（三期 W6）** | 新增 `utils/password_login.py`：免密刷新连续失败 N 次触发；CDP 导航 + VM101 真机 SendInput 输入账号 / 密码 / 提交，拿回 cookie 回写并重启监听任务 |
+| **真机兜底 L3（三期 W9）** | 新增 `utils/real_machine_ops.py`：L1（协议）+ L2（路线 C 过滑块）都失败时，用 VM101 常驻 Chrome 把整条人工流程走完（默认关闭） |
+| **写操作限流（三期 W4）** | 新增 `utils/write_guard.py`：写操作走**独立**令牌桶 + 每日上限（与读分桶）；`item_polish` 一并收口 |
+| **图片上传补尺寸（三期 W5）** | `utils/image_uploader.py` 返回 `{url,width,height,size}`（发布 payload 的 `imageInfoDOList` 需要），此前只返回 url 字符串 |
+| **二次确认（三期 W10/W11）** | `ConfirmTokenStore` 一次性令牌（TTL 300s，不落库）+ 6 条确认路由；**白名单是自动执行的唯一入口**，默认全关 |
 
-**明确不做**：在闲鱼侧删除 / 下架商品。全量检索确认项目内不存在任何下架类 MTOP 调用
-（`mtop.idle.item.offline` / `.delete` 都不在代码里），本仓库只做「在本界面隐藏」。
+**两处「删除」别混**：面板商品列表里的「删除」按钮语义仍是**仅在本界面隐藏**（写墓碑 `deleted_items`，
+不碰闲鱼）；三期的**闲鱼侧删除**是另一条显式链路（`utils/item_delete.py` + 面板「删除规则 → 执行」），
+**实测是真删除、不可逆**，两者互不影响。
 
 ---
 
@@ -74,7 +82,7 @@
 
 ### 3.1 应用机（`<VM102_IP>`）
 
-两种方式二选一：**方式 A** 直接用发布好的预构建镜像（推荐，不用构建），**方式 B** 本地叠加构建。
+两种方式二选一：**方式 A** 直接用发布好的预构建镜像（推荐，不用构建），**方式 B** 从仓库叠加构建。
 
 先拉代码与配置（两种方式都要）：
 
@@ -87,21 +95,14 @@ cp .env.example .env && chmod 600 .env
 
 #### 方式 A（推荐）：用发布好的预构建镜像
 
-镜像已推到 Docker Hub **公开仓库**，含路线 C / 隐藏商品 / QQ 通知的全部改动：
+镜像已推到 Docker Hub **公开仓库**（`docker-compose.example.yml` 默认就指向它）：
 
 ```bash
 docker pull wuchen986/xianyu-super-butler:latest
-# 也可固定到日期版本：wuchen986/xianyu-super-butler:20261009
+# 也可固定到日期版本，例如：wuchen986/xianyu-super-butler:20261010
 ```
 
-`docker-compose.yml` 里设成：
-
-```yaml
-image: wuchen986/xianyu-super-butler:latest
-```
-
-> ⚠️ **发布镜像里不含 `slider_routec/token`**（公开镜像不放任何密钥）。
-> 求解器要读到 token 文件才开启鉴权，二选一：
+> ⚠️ **发布镜像里不含 `slider_routec/token`**（公开镜像不放任何密钥）。求解器要读到 token 文件才开启鉴权，二选一：
 >
 > **① 挂载自己的 token（推荐）**
 >
@@ -130,24 +131,38 @@ docker compose ps                       # 等 healthy
 curl -fsS http://localhost:8080/health
 ```
 
-#### 方式 B：本地叠加构建
+#### 方式 B：从仓库叠加构建
 
-改过 `custom/` 下任何文件、或不想用发布镜像时用：
+改过 `custom/` 下任何文件、或不想用发布镜像时用。
+
+注意 `custom/global_config.yml`（构建期被 `COPY` 进镜像）与 `custom/slider_routec/token`
+（运行期 `start.sh --token-file token`）**都被 `.gitignore` 忽略**，克隆出来没有这两个文件 ——
+前者缺了**构建直接失败**，后者缺了**求解器起不来**。所以先造出来再构建：
 
 ```bash
-# 1) 路线 C 令牌：容器内求解器与客户端用同一个
+# 1) 补两个被忽略的文件
+#    1a. 容器配置：仓库里只有脱敏模板，复制成实际使用的 global_config.yml
+cp custom/global_config.example.yml custom/global_config.yml
+#    1b. 路线 C 令牌：容器内求解器与客户端用同一个，且必须与 .env 的 SLIDER_ROUTE_C_TOKEN 一致
+TOKEN="$(head -c 32 /dev/urandom | base64)"
 mkdir -p custom/slider_routec
-printf '%s' '<与 .env 里 SLIDER_ROUTE_C_TOKEN 相同的值>' > custom/slider_routec/token
+printf '%s' "$TOKEN" > custom/slider_routec/token
 chmod 600 custom/slider_routec/token
+sed -i "s|^SLIDER_ROUTE_C_TOKEN=.*|SLIDER_ROUTE_C_TOKEN=$TOKEN|" .env
 
 # 2) 叠加构建（秒级；不编译 python、不下载 Chromium）
 cd custom && docker build -f Dockerfile.overlay -t xianyu-super-butler:custom .
 cd ..
 
-# 3) 把 docker-compose.yml 的 image 改成 xianyu-super-butler:custom，然后起服务
+# 3) 把 docker-compose.yml 的 image 改成 xianyu-super-butler:custom，再起服务
 docker compose up -d
+docker compose ps                       # 等 healthy
+curl -fsS http://localhost:8080/health
 ```
 
+> `SLIDER_ROUTE_C_TOKEN`（`.env`，客户端用）与 `custom/slider_routec/token`（镜像内，求解器用）
+> **必须一致**，否则客户端带 `X-RouteC-Token` 请求求解器会被 401 拒掉。
+>
 > ⚠️ 叠加构建的 `COPY slider_routec /app/slider_routec` 会把 `custom/slider_routec/token`
 > **一起打进镜像**，所以本地构建出的 `xianyu-super-butler:custom` 含你的生产 token。
 > **别把它推到公开仓库。** 想推公开镜像请用方式 A，或在 `custom/` 下放一份
@@ -283,6 +298,82 @@ docker logs xianyu-super-butler | grep -E 'preflight|滑块验证'
 
 `solver` 的启动日志在容器内 `/app/logs/routec-solver-boot.log`，同时 `tee` 到容器 stdout。
 
+### 4.6 发布商品（L1 协议 / L3 真机兜底）
+
+三档链路：**L1 协议**（`utils/item_publish.py` 直调 mtop）→ 撞滑块时 **L2 路线 C** 过滑块后回 L1 重发 →
+L1/L2 都失败且 `real_machine_fallback=true` 时 **L3 真机兜底**（`utils/real_machine_ops.py`，
+VM101 常驻 Chrome 把整条人工流程走完）。
+
+- 面板「商品自动化」素材行点「发布」→ 后端返回**摘要 + 一次性确认令牌**（TTL 300s）→
+  弹窗确认后带令牌执行；**摘要没回来前按钮 disabled**。
+- 定时自动发布只处理**白名单**（`product_materials.auto_approved=1 AND publish_status='ready'`），
+  非白名单跳过并记原因；总开关 `product_auto_enabled` 默认 **false**。
+- `publish_dry_run` 默认 **true**（只组装 payload、脱敏打印，不发请求）—— 真发布前必须显式关掉。
+
+接口清单与版本号：
+
+| 用途 | api | version | spm_cnt |
+| --- | --- | --- | --- |
+| 发布 | `mtop.idle.pc.idleitem.publish` | 1.0 | `a21ybx.publish.0.0` |
+| 类目识别 | `mtop.taobao.idle.kgraph.property.recommend` | 2.0 | `a21ybx.publish.0.0` |
+| 默认地址 | `mtop.taobao.idle.local.poi.get` | 1.0 | `a21ybx.publish.0.0` |
+
+### 4.7 下架 / 删除（真删除，不可逆）
+
+面板「删除规则」点「执行」→ 同样是**摘要 + 确认令牌**两段式；自动执行只处理白名单
+（`product_delete_rules.auto_execute=1 AND enabled=1`）。
+
+链路：`utils/item_delete.py` 调 `com.taobao.idle.item.delete` **v1.1**（注意不是 1.0，spm `a21ybx.item.0.0`）。
+**实测语义 = 真删除**：返回 `['SUCCESS::调用成功']` 后商品从在售列表消失、`pc.detail` 回
+`FAIL_BIZ_ITEM_DEL_NOT_FOUND`，**不可恢复**。返回值带 `semantics` 字段，不要自己猜。
+
+### 4.8 账号密码自动登录
+
+**触发**：免密刷新（cookie 续期）**连续失败 `pwd_login_fail_threshold`（默认 5）次**后自动走密码登录；
+任一次刷新成功即清零。
+
+**动作**：CDP 连 VM101 常驻 Chrome 做导航 / 读 DOM / 取坐标 / cookie 读写；账号、密码、提交
+**全部走真机 SendInput**（`type` / `key` / `keydown` / `keyup`）。人脸 / 短信**不自动过** ——
+截图 + 推 QQ + 状态 `need_manual` + 进冷却，必须人工。
+
+手动触发：面板账号页，或 `POST /password-login`（body `cookie_id`）→ 轮询
+`GET /password-login/check/{session_id}`（processing / success / need_manual / failed）；
+重置冷却 `POST /password-login/reset-cooldown`。
+
+### 4.9 写操作限流
+
+写操作（擦亮 / 发布 / 下架 / 删除）走 `utils/write_guard.py` 的**独立**令牌桶，不再与读共用。
+超限 **fail fast**（返回 `rate_limited=true` + `retry_after` 秒），**不排队等待**。
+每日计数按 `Asia/Shanghai` 自然日，存独立表 `write_op_counters`。
+
+### 4.10 二次确认令牌
+
+`app/product_automation.py` 的 `ConfirmTokenStore`：一次性、TTL 300s、内存 dict、**不落库**（重启即失效）。
+发布 / 执行删除都先 `prepare` 拿令牌（同时返回「将要发生什么」的摘要），再 `execute` 带令牌。
+**白名单是自动执行的唯一入口**；没进白名单、没开总开关时，只有人工 + 令牌能触发。
+
+### 4.11 面板配置键总表
+
+这些键都在 `system_settings`，用 `GET /system-settings` / `PUT /system-settings/{key}` 读写
+（`PUT` 接受任意新键），面板改完**热生效、不用重建镜像**：
+
+| 键 | 默认 | 作用 |
+| --- | --- | --- |
+| `write_rate_enabled` | true | 写限流总开关 |
+| `write_rate_per_minute` | 1 | 写操作每分钟上限 |
+| `write_daily_limit` | 20 | 单账号每日写操作上限 |
+| `pwd_login_enabled` | true | 密码登录总开关 |
+| `pwd_login_fail_threshold` | 5 | 免密刷新连续失败几次触发密码登录 |
+| `pwd_login_cooldown_minutes` | 30 | 触发后冷却（分钟） |
+| `publish_dry_run` | true | 发布只组装 payload，不发请求 |
+| `real_machine_fallback` | false | L1+L2 失败时自动走 L3 真机兜底 |
+| `product_auto_enabled` | false | 商品自动化定时循环总开关 |
+| `product_auto_interval` | 3600 | 循环间隔（秒，下限 600） |
+| `slider_route_c_max_attempts` | 5 | 路线 C 一次求解序列的最大轮数 |
+
+> 每个账号还有 `pwd_login_fail_count:<cookie_id>` / `pwd_login_cooldown_until:<cookie_id>` /
+> `pwd_login_attempt_fail:<cookie_id>` / `pwd_login_status:<cookie_id>` 这几个运行时键。
+
 ---
 
 ## 5. 已知限制
@@ -292,7 +383,9 @@ docker logs xianyu-super-butler | grep -E 'preflight|滑块验证'
 - **人工投屏链路已移除**：不再有「把验证页投到面板上人工拖」的功能。
   账号页仍保留「在我的浏览器打开验证页」（把新鲜 punish 链接交给用户自己的浏览器），
   它不依赖被删模块。
-- **没有「在闲鱼侧删除 / 下架商品」的能力**（上游也没有）。本仓库的「删除」= 仅本界面隐藏。
+- **面板商品列表的「删除」= 仅本界面隐藏**（写墓碑 `deleted_items`）；**真正的闲鱼侧删除**是另一条显式链路
+  （面板「删除规则 → 执行」，`utils/item_delete.py`），实测 `com.taobao.idle.item.delete` **v1.1** 是
+  **真删除、不可逆**。两者不要混。
 - Windows 锁屏后 `SendInput` 到不了桌面（安全桌面限制）；`driver.ps1` 的 `unlock` 是兜底，
   主防线是关闭锁屏 / 睡眠。
 - 上游 `latest` 镜像与源码可能比本仓库新；本仓库基于上文标注的提交。

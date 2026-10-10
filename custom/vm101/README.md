@@ -43,7 +43,7 @@ C:\reverselab\
 
 ---
 
-## 3. 三个计划任务
+## 3. 计划任务（route C 链路上的四个）
 
 ### 3.1 `WinInputDriver` —— 执行器
 
@@ -51,8 +51,16 @@ C:\reverselab\
 `SendInput` 从 Session 0 发不出去，到不了 Session 1 的桌面。
 
 - Action：`wscript.exe C:\reverselab\wininput\run-hidden.vbs`
-- Principal：`<交互用户>` / `InteractiveToken` / RunLevel Highest
-- Trigger：登录时（`MSFT_TaskLogonTrigger`）+ 开机
+- Principal：`<交互用户>`（实测 `WIN10-LTSC\Administrator`）/ `InteractiveToken` / RunLevel Highest
+- Trigger：**只有一条** `MSFT_TaskLogonTrigger`（`UserId=WIN10-LTSC\Administrator`、`Delay=PT45S`、Enabled）
+- Settings：`StartWhenAvailable=true`、`MultipleInstancesPolicy=IgnoreNew`、`ExecutionTimeLimit=PT0S`（不限时）
+
+> ⚠️ **不要给它加 `MSFT_TaskBootTrigger`**：`InteractiveToken` 的 principal 在开机那一刻拿不到交互令牌，
+> 会话 1 还不存在，`SendInput` 没有桌面可发。本机已开**开机自动登录**（§4），
+> 所以「开机自启」语义由「自动登录后的 AtLogon」实现。
+> 45s `Delay` 用于避开登录风暴；实测重启（2026-10-10 01:20）后：
+> 自动登录 01:20:28 → 触发 01:21:13 → `driver.log` 记 `listening ... session=1` @01:21:15，全程无人工干预。
+> 判活只看 `probe`（§5），**不要**看任务状态（恒为 `Ready`）。
 
 `run-hidden.vbs` 的内容（**别直接跑 `powershell -File driver.ps1`**，
 那样会在交互桌面弹一个控制台窗口，盖住浏览器并抢走鼠标事件）：
@@ -68,11 +76,21 @@ sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\reverselab\wi
 ### 3.2 `ChromeWinInput` —— 拉起 Chrome（带 CDP）
 
 - Action：启动 Chrome，带 `--remote-debugging-port=9222` 与独立 `--user-data-dir`
+- Principal：`<交互用户>`（实测 `WIN10-LTSC\Administrator`）/ `InteractiveToken` / RunLevel Highest
+- Trigger：**只有一条** `MSFT_TaskLogonTrigger`（`UserId=WIN10-LTSC\Administrator`、`Delay=PT45S`、Enabled）
+- Settings：`StartWhenAvailable=true`、`MultipleInstancesPolicy=IgnoreNew`、`ExecutionTimeLimit=PT0S`
 - 用途：`driver.ps1` 的 `launch-chrome` 动作会 `schtasks /Run /TN ChromeWinInput`
 
+> 同样不要加 BootTrigger（同 §3.1）。`ExecutionTimeLimit` 原为 `PT72H`，会在 3 天后把 Chrome 掐掉 ——
+> 已改为 `PT0S`（不限时）。`IgnoreNew` 保证「已在跑」时重复触发被忽略。
+
+实际命令行（实测）：
+
 ```
-chrome.exe --remote-debugging-port=9222 --user-data-dir=C:\reverselab\chrome-profile ^
-           --no-first-run --no-default-browser-check about:blank
+chrome.exe --user-data-dir=C:\reverselab\chrome-wininput --remote-debugging-port=9222 ^
+           --remote-allow-origins=* --disable-gpu-sandbox --no-first-run ^
+           --no-default-browser-check --disable-features=Translate ^
+           --window-position=0,0 --window-size=1920,1080 about:blank
 ```
 
 ### 3.3 `WinInputTunnel` —— 反向 SSH 隧道
@@ -114,6 +132,21 @@ goto loop
 - 杀进程后 **~17s** 自愈（5s 循环 + 一次重连竞争）。
 - `<VM100_IP>` 侧需要有 `<转发机用户>` 的 `authorized_keys` 里对应这把私钥。
 - **同一个端口不要开两条隧道**：两条都带 `ExitOnForwardFailure=yes`，后到的那条会直接退出。
+
+### 3.4 `WinInputTunnel2` —— 第二条反向隧道（→ VM102，route C 实际使用）
+
+§3.3 的 `WinInputTunnel` 把 8791/9222 反连到 **VM100**，是早期形态；应用机改成 VM102 之后，
+链路末端由这条**第二条隧道**承载（VM102 上 `ss -tln` 可见 `<VM102_IP>:8791` / `:9222`，owner 是 `sshd-session`）。
+
+- Action：`wscript.exe C:\reverselab\wininput\run-hidden-revtunnel2.vbs` → `revtunnel2.cmd`
+- Principal：`WIN10-LTSC\Administrator` / `InteractiveToken` / RunLevel Highest
+- Trigger：`MSFT_TaskLogonTrigger`（`UserId=WIN10-LTSC\Administrator`，**无 Delay**）
+- Settings：`StartWhenAvailable`、`MultipleInstances=IgnoreNew`、`ExecutionTimeLimit=PT0S`、`RestartOnFailure=999 / PT1M`
+- 转发：`-R <VM102_IP>:8791:127.0.0.1:8791` 与 `-R <VM102_IP>:9222:127.0.0.1:9222`，登录用户 `root@<VM102_IP>`
+  （VM102 侧 `sshd_config.d/10-gatewayports.conf` = `GatewayPorts clientspecified`）
+- 日志：`C:\reverselab\logs\revtunnel2.log`
+
+> 它没有 Delay，比 driver/Chrome 先起：ssh 先把 VM102 的 8791/9222 端口占住，driver/Chrome 稍后起来也能立刻被转发到。
 
 ---
 

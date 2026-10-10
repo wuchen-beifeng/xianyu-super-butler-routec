@@ -256,3 +256,52 @@ docker logs xianyu-super-butler | grep -iE "traceback|importerror|modulenotfound
 # 3) 面板账号页：无「人工验证」按钮，有「扫码添加账号」
 ```
 
+---
+
+## 三期（2026-10-10，W4–W17）：发布 / 下架 / 密码登录 / 真机兜底 / 写限流 / 二次确认
+
+三期在二期（路线 C + 隐藏/恢复 + QQ 通知）之上补齐「能写」的能力：**发布**、**下架/删除**、
+**账号密码自动登录**，并给所有写操作加**限流**与**二次确认**。逐文件清单如下。
+
+### 新增文件
+
+| 文件 | 卡 | 说明 |
+| --- | --- | --- |
+| `utils/write_guard.py` | W4 | 写操作**独立**令牌桶 + 每日上限（`write_op_counters` 表），超限 fail fast、不 sleep |
+| `utils/risk_control.py` | W4 | 上游同名文件的改写版：熔断 + 令牌桶（**读**用）；写桶拆到 `write_guard.py` |
+| `utils/item_polish.py` | W4 | 上游擦亮的改写版：逐商品擦亮接入写限流（此前 15 件 15 秒打完，等于绕开限流） |
+| `utils/image_uploader.py` | W5 | 上游同名文件的改写版：`upload_image()` 返回 `{url,width,height,size}`（发布 payload 的 `imageInfoDOList` 要） |
+| `utils/password_login.py` | W6 | 密码登录编排：触发门 + CDP 导航 + 真机 SendInput 输入账号/密码/提交 + cookie 回写 |
+| `utils/item_publish.py` | W7 | 发布链路：类目识别 + 账号默认地址 + 发布本体（L1 协议 mtop） |
+| `utils/item_delete.py` | W8 | 下架 / 删除：`com.taobao.idle.item.delete` **v1.1**（实测真删除、不可逆） |
+| `utils/real_machine_ops.py` | W9 | L3 真机兜底：`browser_publish()` / `browser_delete()`（CDP 导航 + driver SendInput） |
+| `app/product_automation.py` | W10 | 上游同名文件的改写版：白名单通道 + run 记录 + 状态机 + `ConfirmTokenStore`（一次性令牌，TTL 300s） |
+
+### 修改文件（相对二期）
+
+| 文件 | 卡 | 改了什么 |
+| --- | --- | --- |
+| `Dockerfile.overlay` | W4–W15 | 末尾追加三期各层 COPY + 构建期断言；W15 收口为「整体 import + 符号抽查 + 前端产物正向断言」 |
+| `XianyuAutoAsync.py` | W6 | 加 `_try_password_login_refresh()`（调 `password_login_refresh`，带成功/失败计数）；发布/下架失败处加 L3 钩子 |
+| `app/db_manager.py` | W7 | `cookies` 表加 `publish_addr_json` 列（幂等 `ALTER TABLE`）+ `get_publish_addr()` / `set_publish_addr()` |
+| `app/reply_server.py` | W11 | 6 条商品自动化确认路由（`publish/prepare`、`publish`、`auto-approve`、`execute/prepare`、`execute`、`auto-execute`）+ `POST /password-login`、`GET /password-login/check/{session_id}`、`POST /password-login/reset-cooldown` + `GET /write-guard/status` |
+| `slider_routec/driverctl.py` | W6 | 客户端加 `type_text` / `key_vk` / `tap_vk` / `key_down` / `key_up`（+ VK 常量） |
+| `vm101/driver.ps1` | W6 | 加 `type`（`KEYEVENTF_UNICODE` 逐字符）/ `key` / `keydown` / `keyup` 四个 action |
+| `vm101/README.md` | W6/W9 | 补 `WinInputTunnel2`（→ VM102）、`ChromeWinInput` 计划任务、键盘 action 说明 |
+| `frontend/components/ui.tsx` | W12 | 新增 `ConfirmDialog`（展示后端摘要 + 确认；摘要没回来前按钮 disabled） |
+| `frontend/services/api.ts` | W12/W13 | 加 `preparePublish` / `confirmPublish` / `setMaterialAutoApprove` / `prepareDeleteExecute` / `confirmDeleteExecute` / `setDeleteRuleAutoExecute` / `startPasswordLogin` / `checkPasswordLogin` / `resetPasswordLoginCooldown` / `getWriteGuardStatus` |
+| `frontend/components/Settings.tsx` | W13 | 「写操作限流」+「账号密码自动登录」两个设置区（读 `/write-guard/status` 显示实时额度） |
+| `frontend/components/ProductAutomation.tsx` | W14 | 素材行「发布」按钮、删除规则「执行」按钮、白名单开关（`auto_approved` / `auto_execute`） |
+
+### 构建期自检（三期）
+
+`Dockerfile.overlay` 末尾各层已断言三期 9 个模块 `py_compile` + 关键 `grep`；W15 再补三道：
+- 整体 `import` 三期全部模块（**不** import `app.product_automation` / `app.db_manager`，避免构建期触发幂等 DB 迁移把运行时数据写进构建层）；
+- 抽查对外符号（`acquire_write` / `AccountGuard` / `browser_publish` / `publish_item` / `delete_item` / `run_password_login` 等）；
+- 前端产物必须含 `写操作限流` / `账号密码自动登录` / `允许自动发布` / `允许自动执行` / `发布到闲鱼` / `执行删除` / `confirm-dialog` 标记（COPY 是合并语义，产物没更新会静默留旧）。
+
+### 验证记录
+
+端到端验收（发布 / 下架 / 密码登录 / L3 真机兜底 / 白名单跳过 / 写限流，含真实 itemId 与截图证据）
+**8/8 项通过**（W17，2026-10-10）；结果与已排除路径记录在本栈工作台。
+

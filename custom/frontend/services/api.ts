@@ -1410,3 +1410,195 @@ export const createQuoteBook = async (file: File): Promise<{
 
 export const deleteQuoteBook = async (bookId: number): Promise<{ success: boolean }> =>
   del(`/api/logistics/quote-books/${bookId}`);
+
+// ============================================================================
+// W12：W11 新端点封装（发布 / 删除二次确认 + 密码登录 + 写限流状态）
+//
+// 全部路由返回 {success, data}（与同文件既有 product-automation 系列一致）。
+// 确认令牌失败一律 400 + {detail: {reason, message}}，reason ∈
+// token_missing / token_expired / token_mismatch / token_used。
+// ============================================================================
+
+/** preparePublish 返回的发布摘要 + 一次性确认令牌（TTL 300s）。 */
+export interface PublishPrepareResult {
+  confirm_token: string;
+  summary: string;
+  material_id: number;
+  publish_status: string;
+  dry_run: boolean;
+}
+
+/** confirmPublish 的执行结果。 */
+export interface PublishExecuteResult {
+  run_id: number;
+  ok: boolean;
+  publish_status: string;
+  item_id: string;
+  dry_run: boolean;
+  rate_limited: boolean;
+  message: string;
+  summary: string;
+}
+
+/** prepareDeleteExecute 返回的删除候选（与 ProductDeletePreview.candidates 同形）。 */
+export type DeleteCandidate = ProductDeletePreview['candidates'][number];
+
+export interface DeleteExecutePrepareResult {
+  confirm_token: string;
+  candidates: DeleteCandidate[];
+  summary: string;
+  preview_run_id: number;
+  rule_id: number;
+}
+
+/** confirmDeleteExecute 的执行结果（candidates 此处是**数量**）。 */
+export interface DeleteExecuteResult {
+  run_id: number;
+  rule_id: number;
+  candidates: number;
+  deleted_count: number;
+  failed_count: number;
+  skipped_count: number;
+  summary: string;
+}
+
+export interface PasswordLoginStartResult {
+  session_id: string;
+}
+
+export type PasswordLoginStatus = 'processing' | 'success' | 'need_manual' | 'failed' | 'unknown';
+
+export interface PasswordLoginCheckResult {
+  status: PasswordLoginStatus;
+  error: string | null;
+  /** /static/... 可直接当 <img src>；无人脸/短信验证时为 null */
+  screenshot_url: string | null;
+}
+
+/** POST /password-login/reset-cooldown 回读的账号状态快照（不含任何凭据）。 */
+export interface PasswordLoginStatusSnapshot {
+  cookie_id: string;
+  enabled: boolean;
+  fail_threshold: number;
+  cooldown_minutes: number;
+  fail_count: number;
+  attempt_fail: number;
+  cooldown_until: number;
+  cooldown_remaining_s: number;
+  last_status: string;
+}
+
+/** 写限流实时额度。不带 cookie_id 时 accounts 是账号**数量**，per_minute 取各账号 max、daily 取 sum。 */
+export interface WriteGuardStatus {
+  cookie_id: string | null;
+  per_minute_used: number;
+  per_minute_limit: number;
+  daily_used: number;
+  daily_limit: number;
+  accounts?: number;
+}
+
+/** 发一条发布确认令牌；素材必须是 ready 状态。 */
+export const preparePublish = async (materialId: number): Promise<PublishPrepareResult> => {
+  const response = await post<{ success: boolean; data: PublishPrepareResult }>(
+    `/product-automation/materials/${materialId}/publish/prepare`,
+    {},
+  );
+  return response.data;
+};
+
+/** 真发布一条素材（状态机 ready -> publishing -> published / failed）。 */
+export const confirmPublish = async (
+  materialId: number,
+  confirmToken: string,
+): Promise<PublishExecuteResult> => {
+  const response = await post<{ success: boolean; data: PublishExecuteResult }>(
+    `/product-automation/materials/${materialId}/publish`,
+    { confirm_token: confirmToken },
+  );
+  return response.data;
+};
+
+/** 把素材加入 / 移出自动发布白名单，返回更新后的素材。 */
+export const setMaterialAutoApprove = async (
+  materialId: number,
+  enabled: boolean,
+): Promise<ProductMaterial> => {
+  const response = await post<{ success: boolean; data: ProductMaterial }>(
+    `/product-automation/materials/${materialId}/auto-approve`,
+    { enabled },
+  );
+  return response.data;
+};
+
+/** 预演删除计划并发出一次性确认令牌。 */
+export const prepareDeleteExecute = async (ruleId: number): Promise<DeleteExecutePrepareResult> => {
+  const response = await post<{ success: boolean; data: DeleteExecutePrepareResult }>(
+    `/product-automation/delete-rules/${ruleId}/execute/prepare`,
+    {},
+  );
+  return response.data;
+};
+
+/** 真执行删除计划（不可逆）。 */
+export const confirmDeleteExecute = async (
+  ruleId: number,
+  confirmToken: string,
+): Promise<DeleteExecuteResult> => {
+  const response = await post<{ success: boolean; data: DeleteExecuteResult }>(
+    `/product-automation/delete-rules/${ruleId}/execute`,
+    { confirm_token: confirmToken },
+  );
+  return response.data;
+};
+
+/** 把删除计划加入 / 移出自动执行白名单，返回更新后的计划。 */
+export const setDeleteRuleAutoExecute = async (
+  ruleId: number,
+  enabled: boolean,
+): Promise<ProductDeleteRule> => {
+  const response = await post<{ success: boolean; data: ProductDeleteRule }>(
+    `/product-automation/delete-rules/${ruleId}/auto-execute`,
+    { enabled },
+  );
+  return response.data;
+};
+
+/** 启动一次账号密码登录（后台线程跑真机流程），立即返回 session_id 供轮询。 */
+export const startPasswordLogin = async (cookieId: string): Promise<PasswordLoginStartResult> => {
+  const response = await post<{ success: boolean; data: PasswordLoginStartResult }>(
+    '/password-login',
+    { cookie_id: cookieId },
+  );
+  return response.data;
+};
+
+/** 轮询密码登录会话：processing / success / need_manual / failed / unknown。 */
+export const checkPasswordLogin = async (
+  sessionId: string,
+): Promise<PasswordLoginCheckResult> => {
+  const response = await get<{ success: boolean; data: PasswordLoginCheckResult }>(
+    `/password-login/check/${encodeURIComponent(sessionId)}`,
+  );
+  return response.data;
+};
+
+/** 重置指定账号的密码登录失败计数与冷却，返回重置后的状态快照。 */
+export const resetPasswordLoginCooldown = async (
+  cookieId: string,
+): Promise<PasswordLoginStatusSnapshot> => {
+  const response = await post<{ success: boolean; data: PasswordLoginStatusSnapshot }>(
+    '/password-login/reset-cooldown',
+    { cookie_id: cookieId },
+  );
+  return response.data;
+};
+
+/** 读写限流实时额度（只读，不消耗令牌）。不传 cookieId 时返回当前用户全部账号的汇总。 */
+export const getWriteGuardStatus = async (cookieId?: string): Promise<WriteGuardStatus> => {
+  const response = await get<{ success: boolean; data: WriteGuardStatus }>(
+    '/write-guard/status',
+    cookieId ? { cookie_id: cookieId } : undefined,
+  );
+  return response.data;
+};

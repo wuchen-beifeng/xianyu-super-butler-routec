@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from typing import List, Tuple, Optional, Dict, Any
 from pathlib import Path
 import secrets
+import shutil
 import time
 import json
 import os
@@ -21,7 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 from app import cookie_manager
 from app.db_manager import db_manager
 from app.delivery_template import send_payload as send_delivery_payload
-from app.product_automation import ProductAutomationService
+from app.product_automation import ProductAutomationService, ConfirmTokenError
 from app.file_log_collector import setup_file_logging, get_file_log_collector
 from app.ai_reply_engine import ai_reply_engine
 from app.services.notification_channels import (
@@ -5078,6 +5079,367 @@ def compensate_product_cards(
     return {
         "success": True,
         "data": product_automation.compensate_cards(current_user["user_id"]),
+    }
+
+
+# ==================== W11：发布/删除确认 + 密码登录 + 写限流状态 ====================
+#
+# 本段只**新增**路由：既有路由的路径 / 入参 / 返回形状一字未改。
+# 新路由一律返回 {"success": true, "data": {...}} —— 与同文件既有路由一致，
+# 前端 api.ts 现有封装都是取 response.data。
+#
+# 确认令牌本身在领域层（app/product_automation.py 的 ConfirmTokenStore）：
+# TTL 300s、一次性、绑定 (resource_id, action)、内存 dict 不落库。
+# 本层只负责把 ConfirmTokenError 翻成 400 并把 reason 带出去。
+
+
+def _raise_confirm_token_error(error: ConfirmTokenError):
+    """确认令牌校验失败一律 400；正文带稳定 reason 键供前端区分四种情况。"""
+    raise HTTPException(
+        status_code=400,
+        detail={"reason": error.reason, "message": str(error)},
+    )
+
+
+def _product_automation_call(action):
+    """统一领域异常 -> HTTP 映射。
+
+    先捕 ConfirmTokenError —— 它是 PermissionError 的子类，晚捕会被 403 吃掉。
+    """
+    try:
+        return {"success": True, "data": action()}
+    except ConfirmTokenError as error:
+        _raise_confirm_token_error(error)
+    except Exception as error:
+        _raise_product_automation_error(error)
+
+
+class ConfirmTokenRequest(BaseModel):
+    confirm_token: Optional[str] = None
+
+
+class AutoFlagRequest(BaseModel):
+    enabled: bool = False
+
+
+class PasswordLoginRequest(BaseModel):
+    cookie_id: str
+
+
+class PasswordLoginResetRequest(BaseModel):
+    cookie_id: str
+
+
+@app.post("/product-automation/materials/{material_id}/publish/prepare")
+def prepare_product_material_publish(
+    material_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """发一条一次性发布确认令牌，并把将要发生的事写清楚给面板展示。"""
+    return _product_automation_call(
+        lambda: product_automation.prepare_publish(material_id, current_user["user_id"])
+    )
+
+
+@app.post("/product-automation/materials/{material_id}/publish")
+def execute_product_material_publish(
+    material_id: int,
+    payload: ConfirmTokenRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """真发布一条素材；人工入口带 prepare 发的一次性确认令牌。"""
+    return _product_automation_call(
+        lambda: product_automation.execute_publish(
+            material_id,
+            confirm_token=payload.confirm_token,
+            user_id=current_user["user_id"],
+        )
+    )
+
+
+@app.post("/product-automation/materials/{material_id}/auto-approve")
+def set_product_material_auto_approve(
+    material_id: int,
+    payload: AutoFlagRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """把素材加入 / 移出自动发布白名单。"""
+    return _product_automation_call(
+        lambda: product_automation.set_material_auto_approve(
+            material_id, payload.enabled, current_user["user_id"]
+        )
+    )
+
+
+@app.post("/product-automation/delete-rules/{rule_id}/execute/prepare")
+def prepare_product_delete_execute(
+    rule_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """预演一遍删除计划并把候选写进 run，再发一次性确认令牌。"""
+    return _product_automation_call(
+        lambda: product_automation.prepare_delete_execute(rule_id, current_user["user_id"])
+    )
+
+
+@app.post("/product-automation/delete-rules/{rule_id}/execute")
+def execute_product_delete_rule(
+    rule_id: int,
+    payload: ConfirmTokenRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """真执行删除计划；人工入口带 prepare 发的一次性确认令牌。"""
+    return _product_automation_call(
+        lambda: product_automation.execute_delete_rule(
+            rule_id,
+            confirm_token=payload.confirm_token,
+            user_id=current_user["user_id"],
+        )
+    )
+
+
+@app.post("/product-automation/delete-rules/{rule_id}/auto-execute")
+def set_product_delete_rule_auto_execute(
+    rule_id: int,
+    payload: AutoFlagRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """把删除计划加入 / 移出自动执行白名单。"""
+    return _product_automation_call(
+        lambda: product_automation.set_delete_rule_auto_execute(
+            rule_id, payload.enabled, current_user["user_id"]
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# 密码登录（W6 的 utils/password_login.py 之上的路由层）
+#
+# 会话表是进程内 dict：只存状态与截图路径，**绝不存任何凭据值**。
+# run_password_login 是同步阻塞的（最长 240s），必须丢到线程里跑，
+# 否则会卡住事件循环。POST 立即返回 session_id，前端轮询 check。
+# ---------------------------------------------------------------------------
+
+PASSWORD_LOGIN_SESSIONS: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+PASSWORD_LOGIN_SESSION_TTL = 3600  # 已结束会话的保留时长（秒），到期清理
+PASSWORD_LOGIN_SHOT_STATIC_DIR = Path(static_dir) / "uploads" / "images"
+
+
+def _prune_password_login_sessions() -> None:
+    """清掉结束超过 TTL 的会话记录（进程内 dict 的过期清理）。"""
+    now = time.time()
+    stale = [
+        session_id
+        for session_id, item in PASSWORD_LOGIN_SESSIONS.items()
+        if item.get("finished") and now - float(item.get("updated_at") or now) > PASSWORD_LOGIN_SESSION_TTL
+    ]
+    for session_id in stale:
+        PASSWORD_LOGIN_SESSIONS.pop(session_id, None)
+
+
+def _password_login_check_payload(session_id: str) -> Dict[str, Any]:
+    """把内部会话状态映射成面板要的形状：{status, error, screenshot_url}。"""
+    item = PASSWORD_LOGIN_SESSIONS.get(session_id)
+    if not item:
+        return {"status": "unknown", "error": "会话不存在或已过期", "screenshot_url": None}
+    if not item.get("finished"):
+        return {"status": "processing", "error": None, "screenshot_url": None}
+    return {
+        "status": item.get("status") or "failed",
+        "error": item.get("error") or None,
+        "screenshot_url": item.get("screenshot_url"),
+    }
+
+
+def _copy_password_login_screenshot(screenshot_path: Optional[str]) -> Optional[str]:
+    """把密码登录截图复制到 /static 可访问目录，返回可加载的 URL（失败返回 None）。
+
+    截图原本写在 /app/data/pwd_login_shots（不可 HTTP 访问）；复制到
+    /app/static/uploads/images/ 后由既有的 /static 挂载对外提供。
+    """
+    if not screenshot_path:
+        return None
+    try:
+        source = Path(screenshot_path)
+        if not source.is_file():
+            return None
+        PASSWORD_LOGIN_SHOT_STATIC_DIR.mkdir(parents=True, exist_ok=True)
+        target = PASSWORD_LOGIN_SHOT_STATIC_DIR / source.name
+        shutil.copyfile(source, target)
+        return f"/static/uploads/images/{target.name}"
+    except Exception as exc:
+        logger.warning(f"密码登录截图复制失败: {type(exc).__name__}: {str(exc)[:120]}")
+        return None
+
+
+def _password_login_worker(session_id: str, cookie_id: str) -> None:
+    """在线程里跑同步的 run_password_login，把结构化结果落回会话表。
+
+    结果里**不含任何凭据值**（W6 已保证），本层只挑状态 / 原因 / 截图。
+    """
+    try:
+        from utils import password_login as password_login_module
+
+        result = password_login_module.run_password_login(cookie_id)
+        ok = bool(result.get("ok"))
+        status = str(result.get("status") or ("success" if ok else "failed"))
+        reason = str(result.get("reason") or "")
+        detail = str(result.get("detail") or "")
+        error = None
+        if not ok:
+            if status == "need_manual":
+                error = f"需要人工验证：{detail or reason or '人脸 / 短信验证'}"
+            else:
+                error = detail or reason or "密码登录失败"
+        item = PASSWORD_LOGIN_SESSIONS.get(session_id)
+        if item is not None:
+            item.update({
+                "finished": True,
+                "ok": ok,
+                "status": status,
+                "error": error,
+                "screenshot_url": _copy_password_login_screenshot(result.get("screenshot")),
+                "cookie_count": int(result.get("cookie_count") or 0),
+                "updated_at": time.time(),
+            })
+    except Exception as exc:
+        logger.exception("密码登录后台任务异常")
+        item = PASSWORD_LOGIN_SESSIONS.get(session_id)
+        if item is not None:
+            item.update({
+                "finished": True,
+                "ok": False,
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                "screenshot_url": None,
+                "updated_at": time.time(),
+            })
+
+
+@app.post("/password-login")
+async def start_password_login(
+    payload: PasswordLoginRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """启动一次账号密码登录（后台线程跑真机流程），立即返回 session_id 供轮询。"""
+    _prune_password_login_sessions()
+    cookie_id = str(payload.cookie_id or "").strip()
+    if not cookie_id:
+        raise HTTPException(status_code=400, detail="缺少 cookie_id")
+    if not db_manager.get_cookie_by_id(cookie_id):
+        raise HTTPException(status_code=404, detail="账号不存在")
+
+    session_id = secrets.token_urlsafe(16)
+    PASSWORD_LOGIN_SESSIONS[session_id] = {
+        "cookie_id": cookie_id,
+        "finished": False,
+        "ok": None,
+        "status": "processing",
+        "error": None,
+        "screenshot_url": None,
+        "started_at": time.time(),
+        "updated_at": time.time(),
+    }
+    log_with_user("info", f"启动账号密码登录会话: {session_id}", current_user)
+    asyncio.create_task(asyncio.to_thread(_password_login_worker, session_id, cookie_id))
+    return {"success": True, "data": {"session_id": session_id}}
+
+
+@app.get("/password-login/check/{session_id}")
+def check_password_login(
+    session_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """轮询密码登录会话：processing / success / need_manual / failed。"""
+    _prune_password_login_sessions()
+    return {"success": True, "data": _password_login_check_payload(session_id)}
+
+
+@app.post("/password-login/reset-cooldown")
+def reset_password_login_cooldown(
+    payload: PasswordLoginResetRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """重置指定账号的密码登录失败计数、连续失败计数与冷却。"""
+    cookie_id = str(payload.cookie_id or "").strip()
+    if not cookie_id:
+        raise HTTPException(status_code=400, detail="缺少 cookie_id")
+    if not db_manager.get_cookie_by_id(cookie_id):
+        raise HTTPException(status_code=404, detail="账号不存在")
+    try:
+        from utils import password_login as password_login_module
+
+        password_login_module.clear_cooldown(cookie_id)
+        password_login_module.set_fail_count(cookie_id, 0)
+        # attempt_fail 没有公开 setter，用模块自己的键名清零（到了上限会「停手」）。
+        password_login_module._ss_set(password_login_module.attempt_fail_key(cookie_id), 0)
+        snapshot = password_login_module.status_snapshot(cookie_id)
+    except Exception as exc:
+        logger.exception("重置密码登录冷却失败")
+        raise HTTPException(status_code=500, detail=f"重置失败: {type(exc).__name__}")
+    log_with_user("info", f"已重置账号 {cookie_id} 的密码登录失败计数与冷却", current_user)
+    return {"success": True, "data": snapshot}
+
+
+# ---------------------------------------------------------------------------
+# 写限流实时额度（只读，绝不消耗令牌）
+#
+# 写令牌桶按账号计；不带 cookie_id 时按当前用户的全部账号汇总：
+#   per_minute_used 取各账号的最大值（分钟桶是每账号独立的，最紧的那个最有参考价值）
+#   daily_used 取各账号之和（当日总写入次数）
+# ---------------------------------------------------------------------------
+
+@app.get("/write-guard/status")
+def get_write_guard_status(
+    cookie_id: Optional[str] = Query(default=None),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """写限流实时额度：本分钟已用/上限、今日已用/上限。只读，不消耗令牌。"""
+    from utils import write_guard
+
+    def _limits() -> Tuple[int, int]:
+        cfg = write_guard.current_config()
+        return int(cfg["rate_per_minute"]), int(cfg["daily_limit"])
+
+    def _used(cid: str) -> Tuple[int, int]:
+        state = write_guard.write_status(cid)
+        return int(state.get("per_minute_used") or 0), int(state.get("daily_used") or 0)
+
+    if cookie_id:
+        per_minute_used, daily_used = _used(cookie_id)
+        per_minute_limit, daily_limit = _limits()
+        return {
+            "success": True,
+            "data": {
+                "cookie_id": cookie_id,
+                "per_minute_used": per_minute_used,
+                "per_minute_limit": per_minute_limit,
+                "daily_used": daily_used,
+                "daily_limit": daily_limit,
+            },
+        }
+
+    user_cookies = db_manager.get_all_cookies(current_user["user_id"]) or {}
+    per_minute_limit, daily_limit = _limits()
+    per_minute_used = 0
+    daily_used = 0
+    for cid in user_cookies.keys():
+        try:
+            minute_used, day_used = _used(cid)
+        except Exception:
+            continue
+        per_minute_used = max(per_minute_used, minute_used)
+        daily_used += day_used
+    return {
+        "success": True,
+        "data": {
+            "cookie_id": None,
+            "accounts": len(user_cookies),
+            "per_minute_used": per_minute_used,
+            "per_minute_limit": per_minute_limit,
+            "daily_used": daily_used,
+            "daily_limit": daily_limit,
+        },
     }
 
 
