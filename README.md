@@ -22,10 +22,13 @@
 
 | 角色 | 占位符 | 干什么 |
 | --- | --- | --- |
-| 应用机 | `<VM102_IP>` | 跑容器（面板 + 后端 + 容器内求解器 `routec-solver`） |
-| 转发机 | `<VM100_IP>` | 把 `<VM102_IP>` 的两个端口转发到 Windows 真机（或直接同机） |
-| 真机 | `<VM101_IP>` | Windows，跑 Chrome + 一个 HTTP 执行器（`driver.ps1`），真正做拖动 |
+| 应用机 | `<VM102_IP>` | 跑容器（面板 + 后端 + 容器内求解器 `routec-solver`），**同时是反向隧道的落点** |
+| 真机 | `<VM101_IP>` | Windows，跑 Chrome + 一个 HTTP 执行器（`driver.ps1`），真正做拖动；用**反向 SSH 隧道**把 `8791` / `9222` 反连到应用机 |
 | 可选 | `<NAS_IP>` | 通知服务（NapCat）、可选的 ddddocr 图像识别服务 |
+
+> 注意：**本应用不需要任何中转机器**。容器直连真机隧道落点（`ROUTEC_DRIVER_URL` / `ROUTEC_CDP_URL`
+> 指 `<VM102_IP>` 即可）。早期文档里的「转发机」（`<VM100_IP>`）中转拓扑已废弃：如果那台机器还在，
+> 它服务的是另一套工具（`reverse_agent` 的抓包 / 隧道链路），与本应用无关。
 
 数据流（滑块）：
 
@@ -35,10 +38,23 @@
        └─ utils/slider_route_c.py  ──HTTP(127.0.0.1:8799)──▶  容器内 slider_routec/solver.py
                                                                  ├─ preflight 六项体检（失败即在发起请求前中止）
                                                                  ├─ 注入账号 cookie，逼出新挑战
-                                                                 └─ driverctl ──HTTP──▶ <VM100_IP>:8791 driver.ps1
+                                                                 └─ driverctl ──HTTP──▶ <VM102_IP>:8791 driver.ps1
                                                                                         └─ SendInput 拖动真机 Chrome
-                                                                                            （CDP 在 <VM100_IP>:9222）
+                                                                                            （CDP 在 <VM102_IP>:9222）
 ```
+
+反向隧道（真机 → 应用机）：
+
+```
+<VM101_IP> win10-ltsc ──revtunnel.cmd──▶ <VM102_IP> 127.0.0.1:{8791, 9222}   ← 本应用直连
+```
+
+- 隧道落地端口由真机侧 `revtunnel.cmd` 用 `ssh -R` 建立；应用机的 sshd 需要
+  `GatewayPorts clientspecified`（默认 `no` 时 `-R` 只绑 `127.0.0.1`，bridge 网络里的容器够不到
+  `<VM102_IP>:8791`）。改法：在 `<VM102_IP>` 的 `/etc/ssh/sshd_config.d/*.conf` 加一行
+  `GatewayPorts clientspecified` 并 `systemctl reload ssh`。
+- 同一端口**不要开两条隧道**：`ExitOnForwardFailure=yes` 会让后到的那条直接退出。
+
 
 滑块**只有这一条路**：失败不回退容器内浏览器，重试 `max_attempts` 轮后仍失败 → 记失败 + 推通知。
 
@@ -65,6 +81,10 @@
 | **写操作限流（三期 W4）** | 新增 `utils/write_guard.py`：写操作走**独立**令牌桶 + 每日上限（与读分桶）；`item_polish` 一并收口 |
 | **图片上传补尺寸（三期 W5）** | `utils/image_uploader.py` 返回 `{url,width,height,size}`（发布 payload 的 `imageInfoDOList` 需要），此前只返回 url 字符串 |
 | **二次确认（三期 W10/W11）** | `ConfirmTokenStore` 一次性令牌（TTL 300s，不落库）+ 6 条确认路由；**白名单是自动执行的唯一入口**，默认全关 |
+| **填表发布入口（四期 v4）** | 「商品自动化 → 素材库」顶部新增「新建素材 / 直接发布」表单：选账号 + 标题 / 描述 / 价格 + **上传本地图片**（后端 `POST /xianyu-image` 传到该账号的闲鱼图床，返回 CDN 链接）→ 建素材（`publish_status` 直接 `ready`）→ 复用既有 prepare / confirm 发布。发布按钮**加了文字**，状态不是 `ready` 时当场给提示 |
+| **单个商品删除入口（四期 v4）** | 「商品自动化」新增「商品管理」tab：列出 `item_info` 里的在售商品，逐行「删除」（`POST /product-automation/items/{cid}/{iid}/delete`，复用 `utils/item_delete`，一次性令牌 + 输入商品 ID 后 4 位二次确认） |
+| **密码登录测试入口（四期 v4）** | 「账号管理」页新增「密码登录测试」：手动触发一次真机密码登录并轮询 `processing / success / need_manual / failed`，`need_manual` 显示截图并提示已推 QQ。**自动触发条件**仍是「免密刷新连续失败 5 次」 |
+| **发布默认真发（四期 v4）** | `publish_dry_run` 缺省值从 `true` 改为 **`false`**（缺失键 = 真发布；非法值仍走安全侧 dry-run）；`app/product_automation.py` 与 `utils/item_publish.py` 两处必须同源 |
 
 **两处「删除」别混**：面板商品列表里的「删除」按钮语义仍是**仅在本界面隐藏**（写墓碑 `deleted_items`，
 不碰闲鱼）；三期的**闲鱼侧删除**是另一条显式链路（`utils/item_delete.py` + 面板「删除规则 → 执行」），
@@ -78,7 +98,8 @@
 
 - Docker + Docker Compose v2
 - 一台 Windows（真机或虚拟机）用于滑块，能跑 Chrome；见 [`custom/vm101/README.md`](custom/vm101/README.md)
-- 三台机器之间 TCP 可达：`<VM102_IP>` → `<VM100_IP>:8791` / `:9222` → `<VM101_IP>`
+- 三台机器之间 TCP 可达：`<VM102_IP>` → `<VM101_IP>:8791` / `:9222`（反向隧道落点），
+  `<VM102_IP>` → `<NAS_IP>`（可选，通知 / 识别服务）
 
 ### 3.1 应用机（`<VM102_IP>`）
 
@@ -180,34 +201,30 @@ curl -fsS http://localhost:8080/health
 
 1. 放好 `driver.ps1` 并注册计划任务 `WinInputDriver`（**必须以交互用户身份运行**，
    `SendInput` 从 session 0 发不到 session 1）；
-2. 注册反向 SSH 隧道（把真机的 `8791` / `9222` 反连到 `<VM100_IP>`）；
+2. 注册**反向 SSH 隧道** `revtunnel.cmd`：把真机的 `8791`（driver）与 `9222`（Chrome CDP）
+   用 `ssh -R` 反连到**应用机** `<VM102_IP>`（这样容器能直接访问 `<VM102_IP>:8791` / `:9222`）；
 3. 关掉锁屏 / 睡眠（`driver.ps1` 的 `unlock` 只是兜底，主防线是不锁屏）。
 
-### 3.3 转发机（`<VM100_IP>`）
-
-在 `<VM100_IP>` 上把 `127.0.0.1:8791` / `127.0.0.1:9222`（即反向隧道落点）
-再转发给 `<VM102_IP>`。**只需要端口转发**，不限实现方式：
-
-- 简单做法：`socat` 或一个小 Python 转发脚本 + systemd 服务；
-- 注意两点坑：① 开机时网卡可能还没就绪 → 绑定要重试，服务要 `Restart=always`；
-  ② 只放行 `<VM102_IP>` 来源，避免把真机输入接口暴露给全网段。
-
-> 若 `<VM102_IP>` 与 Windows 真机在同一网段且你能直连，可省掉这一跳，
-> 把 `ROUTEC_DRIVER_URL` / `ROUTEC_CDP_URL` 直接指向真机即可（见 3.4）。
+> **应用机侧前提**：`<VM102_IP>` 的 sshd 要允许隧道绑到非 loopback 地址，否则容器够不到。
+> 缺这个设置时 `-R` 只绑 `127.0.0.1`，表现为「真机侧隧道看起来建好了，容器连接被拒」。
+> **本应用不需要中转机器**：早期文档里的 `<VM100_IP>` 中转一跳已废弃（`<VM100_IP>` 若存在，是
+> `reverse_agent` 的隧道落点，与本应用无关），容器直连隧道落点即可。
 
 ### 3.4 指向你的地址（替换占位符）
 
-仓库里的默认值全是占位符（`<VM100_IP>` 等），**必须替换**：
+仓库里的默认值全是占位符（`<VM102_IP>` 等），**必须替换**：
 
 | 位置 | 变量 | 默认值 |
 | --- | --- | --- |
-| `custom/slider_routec/preflight.py` | `ROUTEC_DRIVER_URL` | `http://<VM100_IP>:8791/` |
-| 同上 | `ROUTEC_CDP_URL` | `http://<VM100_IP>:9222` |
+| `custom/slider_routec/preflight.py` | `ROUTEC_DRIVER_URL` | `http://<VM102_IP>:8791/`（隧道落点） |
+| 同上 | `ROUTEC_CDP_URL` | `http://<VM102_IP>:9222` |
 | `custom/global_config.example.yml` | `SLIDER_ROUTE_C.endpoint` | `http://127.0.0.1:8799`（容器内求解器，一般不用改） |
 | 同上 | `CAPTCHA_RECOGNITION.base_url` | `http://<NAS_IP>:7777` |
 
-改完 `custom/` 下任何文件都要重新叠加构建（`docker build -f Dockerfile.overlay ...`）再 `docker compose up -d`。
-也可以不重建、改用环境变量覆盖：`ROUTEC_DRIVER_URL` / `ROUTEC_CDP_URL` 直接写进 `.env`。
+`ROUTEC_DRIVER_URL` / `ROUTEC_CDP_URL` 在 `.env.example` 与 `docker-compose.example.yml` 里
+也各留了一份（透传给容器环境变量，**优先级高于源文件默认值**）。改完 `custom/` 下任何文件都要
+重新叠加构建（`docker build -f Dockerfile.overlay ...`）再 `docker compose up -d`；
+也可以不重建、只改 `.env` 里的这两个变量。
 
 ### 3.5 验证链路通不通
 

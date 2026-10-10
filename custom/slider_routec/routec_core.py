@@ -9,7 +9,7 @@
   * 每轮先做**整账号 cookie 交换**（clear + add），不再依赖浏览器里预先登录的账号；
   * 返回结构化结果，不打印任何 cookie / x5sec 值。
 
-硬依赖（VM100 本机 loopback，均由 VM101 反向 SSH 隧道提供）：
+硬依赖（应用机上的反向隧道落点，均由 VM101 反向 SSH 隧道提供）：
   * 127.0.0.1:8791  driver.ps1（session 1，user32!SendInput 执行器）
   * 127.0.0.1:9222  VM101 Chrome CDP
 """
@@ -33,7 +33,7 @@ DEVICE_APPKEY = "444e9908a51d1cb236a27862abc769c9"
 # 避免两处默认值漂移；preflight 在 import 时已把 driverctl.DRIVER_URL 设好。
 DRIVER_URL = preflight.DRIVER_URL
 CDP_URL = preflight.CDP_URL
-driverctl.DRIVER_URL = DRIVER_URL  # fix(2026-10-08): set at module level so /health targets VM100 tunnel (was only set inside run_round)
+driverctl.DRIVER_URL = DRIVER_URL  # fix(2026-10-08): set at module level so /health targets the tunnel landing (was only set inside run_round)
 
 # 这些 cookie 不进浏览器：挑战痕迹（x5secdata/x5sectag/x5step）会让 punish 页
 # 认为挑战仍在进行；x5sec 要清掉才能逼出**新鲜**挑战。

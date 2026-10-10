@@ -33,6 +33,12 @@ services:
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       DB_PATH: /app/data/xianyu_data.db
+      # ── 路线 C 隧道落点（真机执行器 / Chrome CDP）─────────────────────────
+      # 真机侧 revtunnel.cmd 用 `ssh -R` 反连到本机；容器直连这两个端口。
+      # 本机 sshd 需 `GatewayPorts clientspecified`，否则 -R 只绑 127.0.0.1，容器够不到。
+      # 改成本机 IP；不需要任何中转机器。
+      ROUTEC_DRIVER_URL: ${ROUTEC_DRIVER_URL:-http://<VM102_IP>:8791/}
+      ROUTEC_CDP_URL: ${ROUTEC_CDP_URL:-http://<VM102_IP>:9222}
     ports:
       - "${WEB_PORT:-8080}:8080"
     volumes:

@@ -79,6 +79,8 @@ CONFIRM_TOKEN_TTL = 300
 
 ACTION_PUBLISH = "publish"
 ACTION_DELETE_EXECUTE = "delete_execute"
+#: v4：单个商品删除（绑定 cookie_id + item_id 的确认令牌）
+ACTION_ITEM_DELETE = "item_delete"
 
 
 def _material_resource(material_id: Any) -> str:
@@ -87,6 +89,10 @@ def _material_resource(material_id: Any) -> str:
 
 def _delete_rule_resource(rule_id: Any) -> str:
     return f"delete_rule:{rule_id}"
+
+
+def _item_resource(cookie_id: Any, item_id: Any) -> str:
+    return f"item:{cookie_id}:{item_id}"
 
 
 class ConfirmTokenError(PermissionError):
@@ -1028,11 +1034,29 @@ class ProductAutomationService:
         return max(AUTO_INTERVAL_MIN, value)
 
     def publish_dry_run(self) -> bool:
-        """``publish_dry_run``（复用 W7 的键）；缺失 / 非法一律按 **true**。"""
+        """``publish_dry_run``（复用 W7 的键）。
+
+        四期（v4，2026-10-10）改默认值：**缺失（键不存在）时按 ``false``** —— 即默认
+        真发布。此前缺失按 ``true``，配合「素材库为空时不渲染表格」的入口缺陷，用户
+        看到的发布按钮点了也没反应，误判成功能坏了。
+
+        取值规则（与 ``utils/item_publish._is_dry_run`` 保持一致）：
+          - 键缺失（``None``）            → ``False``（默认真发布）
+          - 明确 falsy（0/false/no/off/n）→ ``False``
+          - 明确 truthy（1/true/yes/on/y）→ ``True``（dry-run）
+          - 其余（空串 / 非法值）          → ``True``（安全侧：宁可只组装 payload，
+                                            也不在配置写错时误发真实商品）
+        """
         raw = self._setting(DRY_RUN_KEY)
         if raw is None:
+            return False
+        text = str(raw).strip().lower()
+        if text in ("1", "true", "yes", "on", "y"):
             return True
-        return self._truthy(raw, True)
+        if text in ("0", "false", "no", "off", "n"):
+            return False
+        logger.warning(f"publish_dry_run={raw!r} 既非真也非假，按安全侧 dry-run 处理")
+        return True
 
     # ==================================================================
     # W10：单条素材 / 单条计划读取（带归属校验）
@@ -1700,6 +1724,207 @@ class ProductAutomationService:
             return 0
         logger.info(f"商品自动化失败告警已发送渠道数: {sent}")
         return int(sent or 0)
+
+    # ==================================================================
+    # v4（2026-10-10）：填表发布（新建素材）+ 单个商品删除
+    # ==================================================================
+    #
+    # 背景：三期的发布 / 删除能力都在「素材库每行的纯图标按钮」上，且素材库为空时
+    # 整张表不渲染 —— 用户根本看不到入口。四期把入口搬到显眼的表单：
+    #   - create_material：人工填表建一条素材（publish_status 直接 ready），
+    #     复用既有的 prepare_publish → execute_publish 两条路由发布；
+    #   - prepare_item_delete / execute_item_delete：按 cookie_id + item_id 的
+    #     单个商品删除（复用 W8 的 utils/item_delete.delete_item，过写限流）。
+
+    def _item_title(self, cookie_id: str, item_id: str) -> str:
+        """从 item_info 读商品标题（读不到返回空串，只影响确认弹窗展示）。"""
+        try:
+            with self.db.lock:
+                cursor = self.db.conn.cursor()
+                cursor.execute(
+                    "SELECT item_title FROM item_info WHERE cookie_id = ? AND item_id = ?",
+                    (cookie_id, item_id),
+                )
+                row = cursor.fetchone()
+            return str(row[0] or "") if row else ""
+        except Exception as exc:
+            logger.warning(f"读取商品标题失败 {cookie_id}-{item_id}: {type(exc).__name__}: {exc}")
+            return ""
+
+    def create_material(self, user_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """新建一条素材（「填表发布」入口）。
+
+        素材来源从「筛选规则抓取」扩展到「人工填表」：合成
+        ``source_item_id = manual-<uuid12>``（满足 NOT NULL 与
+        ``UNIQUE(user_id, cookie_id, source_item_id)``），``publish_status`` 直接给
+        ``ready`` —— 省掉旧路径「筛选 → 打开编辑弹窗改状态」那两步隐藏操作。
+
+        ``images`` 收的是**闲鱼 CDN 链接**（前端先调 ``POST /xianyu-image`` 上传拿到），
+        与素材库其它行同构，因此 ``_resolve_images`` / 发布链路无需改动。
+        """
+        cookie_id = str(payload.get("cookie_id") or "").strip()
+        title = str(payload.get("title") or "").strip()
+        if not cookie_id:
+            raise ValueError("请选择发布账号")
+        if not title:
+            raise ValueError("标题不能为空")
+        self.require_account(user_id, cookie_id)
+
+        images = payload.get("images")
+        if isinstance(images, str):
+            try:
+                images = json.loads(images)
+            except Exception:
+                images = [images] if images.strip() else []
+        if not isinstance(images, (list, tuple)):
+            images = []
+        image_list = [str(item).strip() for item in images if str(item).strip()]
+
+        price = payload.get("price")
+        if price in (None, ""):
+            price = None
+        else:
+            try:
+                price = float(price)
+            except (TypeError, ValueError):
+                raise ValueError("价格必须是数字")
+
+        source_item_id = f"manual-{uuid.uuid4().hex[:12]}"
+        with self.db.lock:
+            cursor = self.db.conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO product_materials
+                    (user_id, cookie_id, rule_id, source_item_id, title, description,
+                     category, price, images, source_url, short_url, delivery_content,
+                     publish_status, published_item_id, publish_trace_code)
+                VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, '', '', '', ?, '', '')
+                """,
+                (
+                    user_id,
+                    cookie_id,
+                    source_item_id,
+                    title,
+                    str(payload.get("description") or ""),
+                    str(payload.get("category") or ""),
+                    price,
+                    json.dumps(image_list, ensure_ascii=False),
+                    PUBLISH_STATUS_READY,
+                ),
+            )
+            material_id = cursor.lastrowid
+            self.db.conn.commit()
+        logger.info(
+            f"新建素材 #{material_id}（人工填表）账号={cookie_id} 图片={len(image_list)} 张"
+        )
+        return self.get_material(material_id, user_id)
+
+    def prepare_item_delete(self, user_id: int, cookie_id: str, item_id: str) -> Dict[str, Any]:
+        """单个商品删除的一次性确认令牌（绑定 ``cookie_id + item_id``）。"""
+        cookie_id = str(cookie_id or "").strip()
+        item_id = str(item_id or "").strip()
+        if not cookie_id or not item_id:
+            raise ValueError("缺少账号或商品 ID")
+        self.require_account(user_id, cookie_id)
+        title = self._item_title(cookie_id, item_id)
+        token = self._tokens.issue(_item_resource(cookie_id, item_id), ACTION_ITEM_DELETE)
+        summary = (
+            f"商品 {item_id}「{title}」将从账号 {cookie_id} 真删除"
+            f"（com.taobao.idle.item.delete v1.1，实测语义为不可逆删除，不是下架）；"
+            f"令牌 {CONFIRM_TOKEN_TTL} 秒内有效、只能使用一次"
+        )
+        return {
+            "confirm_token": token,
+            "cookie_id": cookie_id,
+            "item_id": item_id,
+            "item_title": title,
+            "require_text": item_id[-4:],
+            "summary": summary,
+        }
+
+    def execute_item_delete(
+        self,
+        user_id: int,
+        cookie_id: str,
+        item_id: str,
+        *,
+        confirm_token: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """真删除单个商品；必须带 ``prepare_item_delete`` 发的一次性确认令牌。"""
+        cookie_id = str(cookie_id or "").strip()
+        item_id = str(item_id or "").strip()
+        if not cookie_id or not item_id:
+            raise ValueError("缺少账号或商品 ID")
+        self.require_account(user_id, cookie_id)
+        self._tokens.consume(confirm_token, _item_resource(cookie_id, item_id), ACTION_ITEM_DELETE)
+
+        cookies_str = self.db.get_cookie(cookie_id)
+        if not cookies_str:
+            raise ValueError("账号 Cookie 不存在，无法执行删除")
+        try:
+            from utils.item_delete import delete_item
+        except Exception as exc:
+            raise RuntimeError(f"item_delete 不可用: {exc}") from exc
+
+        try:
+            result = self._run_coro(delete_item(cookies_str, item_id, cookie_id=cookie_id))
+        except Exception as exc:
+            logger.exception("单个商品删除异常")
+            raise RuntimeError(f"删除调用异常: {type(exc).__name__}: {exc}") from exc
+
+        changed = 0
+        failed = 0
+        removed = False
+        semantics = result.get("semantics")
+        if result.get("ok"):
+            changed = 1
+            try:
+                removed = bool(self.db.delete_item_info(cookie_id, item_id))
+            except Exception as exc:
+                logger.warning(f"本地记录删除失败 {cookie_id}-{item_id}: {type(exc).__name__}")
+            status = "deleted"
+            message = str(result.get("message") or "平台删除成功")
+        elif result.get("rate_limited"):
+            status = "deferred"
+            message = f"写限流拒绝，未执行：{result.get('message')}"
+        else:
+            failed = 1
+            status = "failed"
+            message = str(result.get("message") or result.get("category") or "未知错误")
+
+        details: List[Dict[str, Any]] = [{
+            "item_id": item_id,
+            "cookie_id": cookie_id,
+            "status": status,
+            "reason": message,
+            "semantics": semantics,
+            "local_record_removed": removed,
+        }]
+        summary = f"单个商品 {item_id} 删除：{status} —— {message}"
+        run_id = self._record_run(
+            user_id, cookie_id, "item_delete", None, "execute",
+            1, 1, changed, failed, summary, details,
+        )
+        if failed:
+            self._notify_failure(
+                cookie_id,
+                f"商品 {item_id} 删除失败（不自动重试）",
+                f"商品：{item_id}（{self._item_title(cookie_id, item_id)}）\n"
+                f"账号：{cookie_id}\n"
+                f"原因：{message}\n"
+                f"详见 run #{run_id}。",
+            )
+        return {
+            "run_id": run_id,
+            "cookie_id": cookie_id,
+            "item_id": item_id,
+            "ok": bool(result.get("ok")),
+            "status": status,
+            "semantics": semantics,
+            "message": message,
+            "local_record_removed": removed,
+            "summary": summary,
+        }
 
     @staticmethod
     def _run_coro(coro):

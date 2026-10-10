@@ -56,7 +56,7 @@ fi
 
 
 # ── 路线 C 求解器（T7 整合进镜像，2026-10-08）──────────────────────
-# routec-solver 现在跑在容器内（127.0.0.1:8799），通过 VM100 的隧道端口
+# routec-solver 现在跑在容器内（127.0.0.1:8799），通过应用机上的反向隧道落点端口
 # 驱动 VM101 真机 SendInput。后台启动，不阻塞主进程。
 if [ -x /app/slider_routec/start.sh ]; then
     # T3：solver 的 stdout/stderr 同时进日志文件与容器 stdout —— 否则 `docker logs

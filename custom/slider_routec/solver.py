@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""solver.py -- 路线 C 求解服务（VM100 侧）。
+"""solver.py -- 路线 C 求解服务（容器内）。
 
 给 VM102 的闲鱼超级管家容器提供「拿 x5sec」的 HTTP 接口：
     POST /solve   {"account": "<cookie_id>", "cookie": "<账号 cookie 串>",

@@ -93,9 +93,11 @@ chrome.exe --user-data-dir=C:\reverselab\chrome-wininput --remote-debugging-port
            --window-position=0,0 --window-size=1920,1080 about:blank
 ```
 
-### 3.3 `WinInputTunnel` —— 反向 SSH 隧道
+### 3.3 `WinInputTunnel` —— 反向 SSH 隧道（**`reverse_agent` 抓包链路用，本应用不用这条**）
 
-把真机的 `8791` / `9222`（以及可选的 `9000` 代理口）反向连到转发机 `<VM100_IP>`。
+把真机的 `8791` / `9222`（以及可选的 `9000` 代理口）反向连到 `<VM100_IP>` ——
+这是给 `reverse_agent` 的 Reqable 抓包链路用的，**与本应用无关**；
+本应用（管家）的滑块链路走 §3.4 那条直连应用机的隧道。
 
 - Action：`cmd.exe /c C:\reverselab\wininput\revtunnel.cmd`
 - Trigger：**开机**（`MSFT_TaskBootTrigger`）
@@ -119,7 +121,7 @@ chrome.exe --user-data-dir=C:\reverselab\chrome-wininput --remote-debugging-port
  -R 8791:127.0.0.1:8791 ^
  -R 9222:127.0.0.1:9222 ^
  -R 9000:127.0.0.1:9000 ^
- <转发机用户>@<VM100_IP> >> C:\reverselab\logs\wininput-tunnel.log 2>&1
+ <应用机用户>@<VM102_IP> >> C:\reverselab\logs\wininput-tunnel.log 2>&1
 echo [%date% %time%] tunnel exited, retrying in 5s >> C:\reverselab\logs\wininput-tunnel.log
 timeout /t 5 /nobreak > NUL
 goto loop
@@ -130,13 +132,14 @@ goto loop
 - `ExitOnForwardFailure=yes`：端口被占用时立刻退出，交给外层循环重试
   （否则会「连上了但没转发」，变成假活）。
 - 杀进程后 **~17s** 自愈（5s 循环 + 一次重连竞争）。
-- `<VM100_IP>` 侧需要有 `<转发机用户>` 的 `authorized_keys` 里对应这把私钥。
+- `<VM102_IP>`（应用机）侧需要有 `<应用机用户>` 的 `authorized_keys` 里对应这把私钥。
 - **同一个端口不要开两条隧道**：两条都带 `ExitOnForwardFailure=yes`，后到的那条会直接退出。
 
 ### 3.4 `WinInputTunnel2` —— 第二条反向隧道（→ VM102，route C 实际使用）
 
-§3.3 的 `WinInputTunnel` 把 8791/9222 反连到 **VM100**，是早期形态；应用机改成 VM102 之后，
-链路末端由这条**第二条隧道**承载（VM102 上 `ss -tln` 可见 `<VM102_IP>:8791` / `:9222`，owner 是 `sshd-session`）。
+§3.3 的 `WinInputTunnel` 反连到 `<VM100_IP>`，那是 `reverse_agent` 抓包用的（见上，与本应用无关）；
+**本应用**的滑块链路末端由这条**第二条隧道**承载（应用机 `<VM102_IP>` 上 `ss -tln` 可见
+`<VM102_IP>:8791` / `:9222`，owner 是 `sshd-session`）。
 
 - Action：`wscript.exe C:\reverselab\wininput\run-hidden-revtunnel2.vbs` → `revtunnel2.cmd`
 - Principal：`WIN10-LTSC\Administrator` / `InteractiveToken` / RunLevel Highest
@@ -241,6 +244,6 @@ schtasks /Run /TN WinInputDriver
 ## 7. 安全
 
 - `driver.ps1` 能注入键盘鼠标 —— **绝不要**把 `8791` 暴露到不可信网络。
-  本方案里它只监听 `127.0.0.1`，对外靠反向 SSH 隧道 + 转发机白名单。
-- 转发机侧只放行应用机（`<VM102_IP>`）来源。
+  本方案里它只监听 `127.0.0.1`，对外靠反向 SSH 隧道 + 应用机侧白名单。
+- 隧道落点侧只放行应用机（`<VM102_IP>`）来源。
 - `unlock.pw` 只给 driver 读，不要进版本库、不要进日志。

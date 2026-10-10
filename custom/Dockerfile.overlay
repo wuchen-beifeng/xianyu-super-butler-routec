@@ -70,8 +70,8 @@ RUN curl -fsSL -o /tmp/chrome.deb https://dl.google.com/linux/direct/google-chro
 # ── T7 集成（2026-10-08 / v2 修订 2026-10-09）：路线 C 是滑块唯一路径 ──────────
 # 容器内浏览器滑块在本栈实测通过率 **0**（阿里 nc 不接受自动化输入），
 # 唯一实测可用的是 **路线 C**：VM101 的 Chrome + 真机 user32!SendInput 拖动，
-# 由容器内 `routec-solver`（127.0.0.1:8799）编排，经 VM100 隧道端口
-# （<VM100_IP>:8791 驱动 / 9222 CDP）访问 VM101。
+# 由容器内 `routec-solver`（127.0.0.1:8799）编排，经应用机上的反向隧道落点
+# （<VM102_IP>:8791 驱动 / 9222 CDP）访问 VM101。
 #   a) 新增 utils/slider_route_c.py —— 后端客户端 + 熔断 + 一键停用开关
 #   b) XianyuAutoAsync.py 的 _handle_captcha_verification **只走路线 C**，失败不回退
 #   c) global_config.yml / app/config.py 新增 SLIDER_ROUTE_C 段（本层上方已 COPY）
@@ -91,8 +91,8 @@ RUN python -m py_compile /app/utils/image_uploader.py \
     && echo "overlay(w5): image_uploader width/height OK"
 
 # ── T7 整合（2026-10-08）：routec-solver 纳入镜像 ──────────────────────────
-# 求解器从 VM100 的 systemd 服务搬进容器：容器内启动 127.0.0.1:8799，
-# driver/CDP 经 VM100 隧道端口（<VM100_IP>:8791/9222）访问 VM101。
+# 求解器从宿主上的 systemd 服务搬进容器：容器内启动 127.0.0.1:8799，
+# driver/CDP 经应用机上的反向隧道落点（<VM102_IP>:8791/9222）访问 VM101。
 COPY slider_routec /app/slider_routec
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/slider_routec/start.sh \
@@ -305,3 +305,36 @@ RUN cd /app \
     && echo "overlay(w15): 三期导入级自检 OK" \
     && ( for s in 写操作限流 账号密码自动登录 允许自动发布 允许自动执行 发布到闲鱼 执行删除 confirm-dialog; do grep -rq "$s" /app/static || { echo "overlay(w15): ✗ 前端产物缺标记 $s"; exit 1; }; done ) \
     && echo "overlay(w15): 前端产物含 W12/W13/W14 新标记"
+
+# ── v4（2026-10-10）：填表发布 + 单个商品删除 + 密码登录测试入口 ───────────────
+# 本期**全部是加法**（未删任何模块 / 路由 / 前端入口）。改动面：
+#   app/reply_server.py        + POST /xianyu-image（本地图 → 闲鱼 CDN 链接）
+#                              + POST /product-automation/materials（新建素材）
+#                              + POST /product-automation/items/{cid}/{iid}/delete[/prepare]
+#   app/product_automation.py  + create_material / prepare_item_delete / execute_item_delete
+#                              + publish_dry_run 默认值：缺失键 true → **false**（真发布）
+#   utils/item_publish.py      + _is_dry_run 默认值同改（与上面那处必须同源）
+#   frontend/**                + 商品自动化页：发布/删除按钮加文字、空态加「去创建筛选规则」、
+#                                「新建素材 / 直接发布」表单、「商品管理」tab（单个删除）
+#                              + 账号管理页：密码登录测试入口
+#                              + 系统设置页：publish_dry_run 显眼说明
+# 沿用同样的做法：只在本文件**末尾追加**（不改动上方任何行），避免与并发构建互相覆盖。
+# 注意：**不 import app.product_automation** —— 它的服务实例在 import 期会跑幂等 DB 迁移，
+# 会把运行时数据写进构建层（W15 已踩过）。这里只做 py_compile + grep。
+RUN python -m py_compile /app/app/reply_server.py /app/app/product_automation.py /app/utils/item_publish.py \
+    && grep -q '"/xianyu-image"' /app/app/reply_server.py \
+    && grep -q "/product-automation/items/{cookie_id}/{item_id}/delete/prepare" /app/app/reply_server.py \
+    && grep -q "/product-automation/items/{cookie_id}/{item_id}/delete" /app/app/reply_server.py \
+    && grep -q "def create_product_material" /app/app/reply_server.py \
+    && grep -q "def create_material" /app/app/product_automation.py \
+    && grep -q "def prepare_item_delete" /app/app/product_automation.py \
+    && grep -q "def execute_item_delete" /app/app/product_automation.py \
+    && grep -q "ACTION_ITEM_DELETE" /app/app/product_automation.py \
+    && echo "overlay(v4): 后端路由 + 服务方法 OK" \
+    && grep -rq "新建素材" /app/static \
+    && grep -rq "直接发布" /app/static \
+    && grep -rq "商品管理" /app/static \
+    && grep -rq "密码登录测试" /app/static \
+    && grep -rq "去创建筛选规则" /app/static \
+    && grep -rq "publish_dry_run" /app/static \
+    && echo "overlay(v4): 前端产物含四期新标记"

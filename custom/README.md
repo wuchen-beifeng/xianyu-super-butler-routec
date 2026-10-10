@@ -171,12 +171,16 @@ docker exec xianyu-super-butler sh -c \
 ### 架构
 
 ```
-VM102 容器 xianyu-super-butler                VM100 (debian13)            VM101 (win10-ltsc)
-  _handle_captcha_verification                  routec-fwd:8791/9222        driver.ps1 (session1)
+VM102 容器 xianyu-super-butler                VM102 (debian13, 隧道落点)     VM101 (win10-ltsc)
+  _handle_captcha_verification                  :8791 / :9222               driver.ps1 (session1)
     └─ utils/slider_route_c.py ──HTTP──►  容器内 routec-solver :8799 ──►   Chrome CDP:9222
-         （失败**不回退**，直接记失败+通知）   routec_core/driverctl/humanize   反向 SSH 隧道
-                                                                          127.0.0.1:8791 / 9222
+         （失败**不回退**，直接记失败+通知）   routec_core/driverctl/humanize   revtunnel.cmd
+                                                                          （ssh -R，反向连到 VM102）
 ```
+
+> 容器**直连隧道落点**（`ROUTEC_DRIVER_URL=http://<VM102_IP>:8791/`），
+> **没有中转机器这一跳**。落点端口是 VM101 侧 `revtunnel.cmd` 用 `ssh -R` 建的反向隧道；
+> 应用机 sshd 需 `GatewayPorts clientspecified`，否则端口只绑 `127.0.0.1`，容器够不到。
 
 - 求解器代码：本目录 `slider_routec/`（`solver.py` / `routec_core.py` / `driverctl.py` /
   `humanize.py` / `xianyu_api.py`），由 `entrypoint.sh` 后台拉起，监听容器内 `127.0.0.1:8799`。

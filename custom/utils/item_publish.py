@@ -463,7 +463,20 @@ def _write_cached_addr(cookie_id: str, addr: Dict[str, Any]) -> bool:
 
 
 def _is_dry_run() -> bool:
-    """``system_settings.publish_dry_run``，缺失或非法一律按 **true**（安全默认）。"""
+    """``system_settings.publish_dry_run``。
+
+    四期（v4，2026-10-10）改默认值：**键缺失时按 ``false``** —— 即默认真发布
+    （与 ``app/product_automation.py:ProductAutomationService.publish_dry_run``
+    保持一致；两处必须同源，否则面板显示会与实际行为不符）。
+
+    取值规则：
+      - 键缺失（``None``）            → ``False``（默认真发布）
+      - 明确 falsy（0/false/no/off/n）→ ``False``
+      - 明确 truthy（1/true/yes/on/y）→ ``True``
+      - 其余（空串 / 非法值）          → ``True``（安全侧：不在配置写错时误发真实商品）
+
+    读库异常（DB 不可用）仍按 ``True`` 处理 —— 拿不到配置时宁可不发。
+    """
     try:
         from app.db_manager import db_manager
 
@@ -472,8 +485,14 @@ def _is_dry_run() -> bool:
         logger.warning(f"读取 publish_dry_run 失败，按 dry-run 处理: {exc}")
         return True
     if raw is None:
+        return False
+    text = str(raw).strip().lower()
+    if text in ("1", "true", "yes", "on", "y"):
         return True
-    return str(raw).strip().lower() in ("1", "true", "yes", "on", "y", "")
+    if text in ("0", "false", "no", "off", "n"):
+        return False
+    logger.warning(f"publish_dry_run={raw!r} 既非真也非假，按安全侧 dry-run 处理")
+    return True
 
 
 # ---------------------------------------------------------------- payload

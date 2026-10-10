@@ -1,7 +1,7 @@
 # driver.ps1 -- VM101-side Win32 real-input executor.  (v2)
 #
 # Runs a small HTTP service on 127.0.0.1:8791 inside VM101's INTERACTIVE session.
-# VM100 sends JSON commands through a reverse SSH tunnel; the driver injects
+# The app host sends JSON commands through a reverse SSH tunnel; the driver injects
 # mouse/keyboard events with user32!SendInput, i.e. through the OS input stack,
 # not via CDP Input.dispatchMouseEvent.
 #

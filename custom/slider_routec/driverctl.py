@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""driverctl.py -- VM100 侧：通过反向 SSH 隧道（127.0.0.1:8791）调用 VM101 的
+"""driverctl.py -- 应用机侧：通过反向 SSH 隧道（127.0.0.1:8791）调用 VM101 的
 Win32 SendInput 执行器。
 
 只做传输，不做轨迹生成（轨迹见 humanize.py）。

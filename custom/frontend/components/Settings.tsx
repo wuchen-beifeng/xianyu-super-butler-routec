@@ -502,6 +502,14 @@ const Settings: React.FC = () => {
               description="限制发布、下架、擦亮等会改动闲鱼数据的写操作频率。"
               icon={Gauge}
             />
+            <div className="mx-4 mb-3 rounded-md border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-900">
+              <strong>发布预演开关 publish_dry_run（重要）</strong>：四期起<strong>默认关闭</strong> ——
+              也就是默认<strong>真发布</strong>（此前默认开启，会让发布只组装 payload 不发请求，容易
+              误判成「发布功能坏了」）。它不在本页表单里，属于高级开关，键名
+              {' '}<code className="rounded bg-amber-100 px-1">system_settings.publish_dry_run</code>；
+              需要临时预演时把该键置为 <code>true</code>（<code>PUT /system-settings/publish_dry_run</code>）。
+              「商品自动化 → 素材库」的发布确认弹窗会显示当前是否处于 dry-run。
+            </div>
             <SettingToggle
               title="启用写操作限流"
               description="关闭后写操作不再限流，账号被平台风控的概率会显著升高。"

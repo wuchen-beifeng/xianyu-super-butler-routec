@@ -1,20 +1,24 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Archive,
+  Boxes,
   CheckCircle2,
   ExternalLink,
   FileSearch,
+  ImagePlus,
   Link2,
   Loader2,
   PackageCheck,
   Pencil,
   Play,
+  Plus,
   RefreshCw,
   Save,
   Search,
   Send,
   ShieldCheck,
   Trash2,
+  Upload,
   Workflow,
   X,
 } from 'lucide-react';
@@ -22,6 +26,7 @@ import {
 import {
   AccountDetail,
   AutomationTaskRun,
+  Item,
   ProductDeletePreview,
   ProductDeleteRule,
   ProductFilterRule,
@@ -30,16 +35,20 @@ import {
 import {
   compensateProductCards,
   confirmDeleteExecute,
+  confirmItemDelete,
   confirmPublish,
+  createProductMaterial,
   deleteProductDeleteRule,
   deleteProductFilterRule,
   deleteProductMaterial,
   getAccountDetails,
+  getItems,
   getProductAutomationRuns,
   getProductDeleteRules,
   getProductFilterRules,
   getProductMaterials,
   prepareDeleteExecute,
+  prepareItemDelete,
   preparePublish,
   previewProductDeleteRule,
   repairProductShortLinks,
@@ -50,7 +59,9 @@ import {
   setDeleteRuleAutoExecute,
   setMaterialAutoApprove,
   updateProductMaterial,
+  uploadXianyuImage,
   DeleteExecutePrepareResult,
+  ItemDeletePrepareResult,
   PublishPrepareResult,
 } from '../services/api';
 import { confirmAction, notify } from '../services/feedback';
@@ -64,14 +75,23 @@ import {
   SectionHeader,
 } from './ui';
 
-type TabKey = 'materials' | 'filters' | 'delete' | 'repairs';
+type TabKey = 'materials' | 'filters' | 'items' | 'delete' | 'repairs';
 
 const tabs: Array<{ id: TabKey; label: string; icon: React.ElementType }> = [
   { id: 'materials', label: '素材库', icon: Archive },
   { id: 'filters', label: '筛选规则', icon: Search },
+  { id: 'items', label: '商品管理', icon: Boxes },
   { id: 'delete', label: '删除计划', icon: Trash2 },
   { id: 'repairs', label: '补偿任务', icon: ShieldCheck },
 ];
+
+/** v4：填表发布表单的初始值；`status` 固定 ready（后端也是直接给 ready）。 */
+const emptyNewMaterialForm = {
+  cookie_id: '',
+  title: '',
+  description: '',
+  price: '',
+};
 
 const emptyFilterForm = {
   id: undefined as number | undefined,
@@ -187,6 +207,23 @@ const ProductAutomation: React.FC = () => {
     prepared: DeleteExecutePrepareResult;
   } | null>(null);
 
+  // v4：填表发布（新建素材 → 直接发布）
+  const [newMaterialOpen, setNewMaterialOpen] = useState(false);
+  const [newMaterialForm, setNewMaterialForm] = useState({ ...emptyNewMaterialForm });
+  const [newMaterialFiles, setNewMaterialFiles] = useState<File[]>([]);
+  const [newMaterialBusy, setNewMaterialBusy] = useState('');
+
+  // v4：商品管理（单个商品删除）
+  const [items, setItems] = useState<Item[]>([]);
+  const [itemAccountFilter, setItemAccountFilter] = useState('');
+  const [itemQuery, setItemQuery] = useState('');
+  const [itemDeletePreview, setItemDeletePreview] = useState<{
+    item: Item;
+    prepared: ItemDeletePrepareResult;
+  } | null>(null);
+
+  const newMaterialFilesRef = useRef<HTMLInputElement | null>(null);
+
   const accountNames = useMemo(
     () => new Map(accounts.map((account) => [
       account.id,
@@ -209,26 +246,48 @@ const ProductAutomation: React.FC = () => {
     });
   }, [materials, accountFilter, materialQuery]);
 
+  // v4：商品管理 tab —— 按账号 + 关键词筛 item_info
+  const visibleItems = useMemo(() => {
+    const query = itemQuery.trim().toLowerCase();
+    return items.filter((item) => {
+      if (itemAccountFilter && item.cookie_id !== itemAccountFilter) return false;
+      if (!query) return true;
+      return [item.item_title, item.item_id, item.item_category]
+        .some((value) => String(value || '').toLowerCase().includes(query));
+    });
+  }, [items, itemAccountFilter, itemQuery]);
+
   const loadAll = async (showLoader = true) => {
     if (showLoader) setLoading(true);
     try {
-      const [accountData, materialData, filterData, deleteData, runData] = await Promise.all([
+      const [accountData, materialData, filterData, deleteData, runData, itemData] = await Promise.all([
         getAccountDetails(),
         getProductMaterials(),
         getProductFilterRules(),
         getProductDeleteRules(),
         getProductAutomationRuns(),
+        // v4：商品管理 tab 的数据源（item_info 同步表）
+        getItems(),
       ]);
       setAccounts(accountData);
       setMaterials(materialData);
       setFilterRules(filterData);
       setDeleteRules(deleteData);
       setRuns(runData);
+      setItems(itemData);
       if (!filterForm.cookie_id && accountData[0]) {
         setFilterForm((current) => ({ ...current, cookie_id: accountData[0].id }));
       }
       if (!deleteForm.cookie_id && accountData[0]) {
         setDeleteForm((current) => ({ ...current, cookie_id: accountData[0].id }));
+      }
+      setNewMaterialForm((current) => (
+        current.cookie_id || !accountData[0]
+          ? current
+          : { ...current, cookie_id: accountData[0].id }
+      ));
+      if (!itemAccountFilter && accountData[0]) {
+        setItemAccountFilter(accountData[0].id);
       }
     } catch (error) {
       notify(`商品自动化数据加载失败：${(error as Error).message}`, 'error');
@@ -431,6 +490,15 @@ const ProductAutomation: React.FC = () => {
   // ------------------------------------------------------------------
 
   const openPublishPreview = async (material: ProductMaterial) => {
+    // v4：不再「点了才报错」—— 状态不对当场说清楚要怎么做
+    if (material.publish_status !== 'ready') {
+      notify(
+        `素材 #${material.id} 当前状态为「${publishStatusOf(material.publish_status).label}」，`
+        + '不能发布：请点铅笔图标把状态改为「待发布」（ready）后再试。',
+        'warning',
+      );
+      return;
+    }
     setBusyKey(`publish-prepare-${material.id}`);
     try {
       const prepared = await preparePublish(material.id);
@@ -537,6 +605,87 @@ const ProductAutomation: React.FC = () => {
     }
   };
 
+  // ------------------------------------------------------------------
+  // v4：填表发布（新建素材 → 复用 prepare → 确认 → publish）
+  // ------------------------------------------------------------------
+
+  const pickNewMaterialFiles = (event: React.ChangeEvent<HTMLInputElement>) => {
+    setNewMaterialFiles(Array.from(event.target.files || []));
+  };
+
+  const submitNewMaterial = async () => {
+    if (!newMaterialForm.cookie_id) {
+      notify('请选择发布账号', 'warning');
+      return;
+    }
+    if (!newMaterialForm.title.trim()) {
+      notify('标题必填', 'warning');
+      return;
+    }
+    setNewMaterialBusy('upload');
+    try {
+      // 图片先传到「所选账号」的闲鱼图床，拿到 CDN 链接再建素材
+      const imageUrls: string[] = [];
+      for (let index = 0; index < newMaterialFiles.length; index += 1) {
+        setNewMaterialBusy(`upload-${index + 1}`);
+        const uploaded = await uploadXianyuImage(newMaterialFiles[index], newMaterialForm.cookie_id);
+        if (uploaded?.url) imageUrls.push(uploaded.url);
+      }
+      setNewMaterialBusy('create');
+      const material = await createProductMaterial({
+        cookie_id: newMaterialForm.cookie_id,
+        title: newMaterialForm.title.trim(),
+        description: newMaterialForm.description,
+        price: newMaterialForm.price === '' ? null : Number(newMaterialForm.price),
+        images: imageUrls,
+      });
+      setNewMaterialOpen(false);
+      setNewMaterialFiles([]);
+      if (newMaterialFilesRef.current) newMaterialFilesRef.current.value = '';
+      setNewMaterialForm({ ...emptyNewMaterialForm, cookie_id: material.cookie_id });
+      setMaterials((current) => [material, ...current.filter((entry) => entry.id !== material.id)]);
+      notify(`素材 #${material.id} 已创建（图片 ${imageUrls.length} 张），确认后即发布`, 'success');
+      await loadAll(false);
+      await openPublishPreview(material);
+    } catch (error) {
+      notify(`填表发布失败：${(error as Error).message}`, 'error');
+    } finally {
+      setNewMaterialBusy('');
+    }
+  };
+
+  // ------------------------------------------------------------------
+  // v4：商品管理 —— 单个商品真删除（prepare → 输入后 4 位 → execute）
+  // ------------------------------------------------------------------
+
+  const openItemDelete = async (item: Item) => {
+    setBusyKey(`item-delete-prepare-${item.item_id}`);
+    try {
+      const prepared = await prepareItemDelete(item.cookie_id, item.item_id);
+      setItemDeletePreview({ item, prepared });
+    } catch (error) {
+      notify(`删除预演失败：${(error as Error).message}`, 'error');
+    } finally {
+      setBusyKey('');
+    }
+  };
+
+  const confirmItemDeleteExecute = async () => {
+    if (!itemDeletePreview) return;
+    const { item, prepared } = itemDeletePreview;
+    setBusyKey(`item-delete-${item.item_id}`);
+    try {
+      const result = await confirmItemDelete(item.cookie_id, item.item_id, prepared.confirm_token);
+      notify(result.summary || result.message, result.ok ? 'success' : 'error');
+      setItemDeletePreview(null);
+      await loadAll(false);
+    } catch (error) {
+      notify(`删除失败：${(error as Error).message}`, 'error');
+    } finally {
+      setBusyKey('');
+    }
+  };
+
   const runRepair = async (
     key: string,
     action: () => Promise<{ summary: string }>,
@@ -606,7 +755,25 @@ const ProductAutomation: React.FC = () => {
                 />
               </label>
             </div>
-            <span className="text-sm font-medium text-gray-500">{visibleMaterials.length} 条素材</span>
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={() => {
+                  setNewMaterialForm({
+                    ...emptyNewMaterialForm,
+                    cookie_id: newMaterialForm.cookie_id || accounts[0]?.id || '',
+                  });
+                  setNewMaterialFiles([]);
+                  if (newMaterialFilesRef.current) newMaterialFilesRef.current.value = '';
+                  setNewMaterialOpen(true);
+                }}
+                className="ios-btn-primary flex items-center gap-2 rounded-md px-4 py-2.5 text-sm"
+              >
+                <Plus className="h-4 w-4" />
+                新建素材 / 直接发布
+              </button>
+              <span className="text-sm font-medium text-gray-500">{visibleMaterials.length} 条素材</span>
+            </div>
           </div>
 
           <div className="section-panel">
@@ -663,6 +830,12 @@ const ProductAutomation: React.FC = () => {
                         <span className={`rounded px-2 py-1 text-xs font-bold ${publishStatusOf(material.publish_status).className}`}>
                           {publishStatusOf(material.publish_status).label}
                         </span>
+                        {material.publish_status === 'draft' && (
+                          <div className="mt-1 text-[11px] leading-4 text-amber-700">需先改为「待发布」才能发布</div>
+                        )}
+                        {material.publish_status === 'failed' && (
+                          <div className="mt-1 text-[11px] leading-4 text-red-600">发布失败，已停止自动重试；处理后改回「待发布」</div>
+                        )}
                       </td>
                       <td className="px-4 py-3 text-xs text-gray-600" data-label="发货绑定">
                         {material.auto_card_id ? `卡券 #${material.auto_card_id}` : '未绑定'}
@@ -699,15 +872,18 @@ const ProductAutomation: React.FC = () => {
                           )}
                           <button
                             type="button"
-                            title="发布到闲鱼"
+                            title={material.publish_status === 'ready'
+                              ? '发布到闲鱼'
+                              : `当前状态「${publishStatusOf(material.publish_status).label}」不能发布：需先改为「待发布」（ready）`}
                             aria-label="发布到闲鱼"
                             disabled={busyKey === `publish-prepare-${material.id}`}
                             onClick={() => void openPublishPreview(material)}
-                            className="rounded p-2 text-blue-600 hover:bg-blue-50 disabled:opacity-50"
+                            className="flex items-center gap-1 rounded px-2 py-1.5 text-xs font-bold text-blue-600 hover:bg-blue-50 disabled:opacity-50"
                           >
                             {busyKey === `publish-prepare-${material.id}`
                               ? <Loader2 className="h-4 w-4 animate-spin" />
                               : <Send className="h-4 w-4" />}
+                            发布
                           </button>
                           <button
                             type="button"
@@ -733,7 +909,26 @@ const ProductAutomation: React.FC = () => {
                 </tbody>
               </table>
             </div>
-            {visibleMaterials.length === 0 && <EmptyState compact title="暂无素材" description="运行筛选规则后，符合条件的商品会进入本地素材库。" icon={Archive} />}
+            {visibleMaterials.length === 0 && (
+              <EmptyState
+                compact
+                title={materials.length === 0 ? '暂无素材' : '当前筛选条件下没有素材'}
+                description={materials.length === 0
+                  ? '运行筛选规则后，符合条件的商品会进入本地素材库；也可以直接用上方「新建素材 / 直接发布」手工建一条。'
+                  : '换一个账号或清空搜索词再看看。'}
+                icon={Archive}
+                action={materials.length === 0 ? (
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('filters')}
+                    className="ios-btn-primary flex items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm"
+                  >
+                    <Search className="h-4 w-4" />
+                    去创建筛选规则
+                  </button>
+                ) : undefined}
+              />
+            )}
           </div>
         </section>
       )}
@@ -1058,13 +1253,14 @@ const ProductAutomation: React.FC = () => {
                 <div className="flex justify-end gap-1">
                   <button
                     type="button"
-                    title="执行删除（真下架，需输入候选商品 ID 后 4 位）"
+                    title="执行删除（真删，需输入候选商品 ID 后 4 位）"
                     aria-label="执行删除"
                     disabled={busyKey === `delete-execute-prepare-${rule.id}`}
                     onClick={() => void openDeleteExecute(rule)}
-                    className="rounded p-2 text-red-600 hover:bg-red-50 disabled:opacity-50"
+                    className="flex items-center gap-1 rounded px-2 py-1.5 text-xs font-bold text-red-600 hover:bg-red-50 disabled:opacity-50"
                   >
                     {busyKey === `delete-execute-prepare-${rule.id}` ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+                    执行删除
                   </button>
                   <button
                     type="button"
@@ -1170,6 +1366,116 @@ const ProductAutomation: React.FC = () => {
               </table>
             </div>
             {runs.length === 0 && <EmptyState compact title="暂无执行记录" description="执行任一自动化任务后，运行结果会显示在这里。" icon={Workflow} />}
+          </div>
+        </section>
+      )}
+
+      {activeTab === 'items' && (
+        <section className="space-y-4">
+          <NoticeBanner
+            type="warning"
+            message="这里是同步到的在售商品（item_info 表）。「删除」是**真删除**（com.taobao.idle.item.delete，实测不可逆），不是下架；需输入商品 ID 后 4 位确认。测试请用 0 在售的号，主号勿动。"
+          />
+
+          <div className="toolbar">
+            <div className="toolbar__group flex-1">
+              <select
+                value={itemAccountFilter}
+                onChange={(event) => setItemAccountFilter(event.target.value)}
+                className="ios-input rounded-md px-3 py-2.5 text-sm sm:w-64"
+              >
+                <option value="">全部账号</option>
+                {accounts.map((account) => (
+                  <option key={account.id} value={account.id}>{accountNames.get(account.id)}</option>
+                ))}
+              </select>
+              <label className="relative min-w-0 flex-1">
+                <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
+                <input
+                  value={itemQuery}
+                  onChange={(event) => setItemQuery(event.target.value)}
+                  placeholder="搜索商品标题、ID 或分类"
+                  className="ios-input w-full rounded-md py-2.5 pl-10 pr-3 text-sm"
+                />
+              </label>
+            </div>
+            <span className="text-sm font-medium text-gray-500">{visibleItems.length} 件商品</span>
+          </div>
+
+          <div className="section-panel">
+            <SectionHeader
+              title="在售商品"
+              description="数据来源：商品同步写入的 item_info 表。「删除」走真删除接口，不可逆。"
+              icon={Boxes}
+            />
+            <div className="overflow-x-auto">
+              <table className="data-table responsive-data-table min-w-[900px] text-sm">
+                <thead>
+                  <tr>
+                    <th className="px-4 py-3">商品</th>
+                    <th className="px-4 py-3">账号</th>
+                    <th className="px-4 py-3">商品 ID</th>
+                    <th className="px-4 py-3">状态</th>
+                    <th className="px-4 py-3 text-right">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {visibleItems.map((item) => (
+                    <tr key={`${item.cookie_id}-${item.item_id}`} className="hover:bg-gray-50">
+                      <td className="px-4 py-3" data-label="商品">
+                        <div className="flex items-center gap-3">
+                          <div className="h-12 w-12 flex-none overflow-hidden rounded bg-gray-100">
+                            {item.item_image ? (
+                              <img
+                                src={normalizeImage(item.item_image)}
+                                alt=""
+                                className="h-full w-full object-cover"
+                                referrerPolicy="no-referrer"
+                              />
+                            ) : <Boxes className="m-3 h-6 w-6 text-gray-400" />}
+                          </div>
+                          <div className="min-w-0">
+                            <div className="max-w-72 truncate font-bold text-gray-900">{item.item_title || '（无标题）'}</div>
+                            <div className="mt-1 text-xs text-gray-500">
+                              {item.item_price ? `¥${item.item_price}` : '价格未知'}
+                              {item.item_category ? ` · ${item.item_category}` : ''}
+                            </div>
+                          </div>
+                        </div>
+                      </td>
+                      <td className="px-4 py-3 text-gray-600" data-label="账号">{accountNames.get(item.cookie_id) || item.cookie_id}</td>
+                      <td className="px-4 py-3 font-mono text-xs text-gray-700" data-label="商品 ID">{item.item_id}</td>
+                      <td className="px-4 py-3 text-xs text-gray-600" data-label="状态">{item.listing_status || '-'}</td>
+                      <td className="px-4 py-3" data-label="操作">
+                        <div className="flex justify-end">
+                          <button
+                            type="button"
+                            title="删除该商品（真删除，不可逆；需输入商品 ID 后 4 位确认）"
+                            aria-label="删除商品"
+                            disabled={busyKey === `item-delete-prepare-${item.item_id}`}
+                            onClick={() => void openItemDelete(item)}
+                            className="flex items-center gap-1 rounded px-2 py-1.5 text-xs font-bold text-red-600 hover:bg-red-50 disabled:opacity-50"
+                          >
+                            {busyKey === `item-delete-prepare-${item.item_id}`
+                              ? <Loader2 className="h-4 w-4 animate-spin" />
+                              : <Trash2 className="h-4 w-4" />}
+                            删除
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {visibleItems.length === 0 && (
+              <EmptyState
+                compact
+                title="该账号暂无同步到的商品"
+                description="商品同步会把在售商品写入本地；刚发布的可等下一次同步，或到「商品与发货」页手动同步。"
+                icon={Boxes}
+              />
+            )}
           </div>
         </section>
       )}
@@ -1404,6 +1710,172 @@ const ProductAutomation: React.FC = () => {
                 message="当前 publish_dry_run=true：确认后只组装 payload，不会真的发布到闲鱼。"
               />
             )}
+          </div>
+        </ConfirmDialog>
+      )}
+
+      {newMaterialOpen && (
+        <div className="modal-overlay">
+          <div className="modal-container modal-container-lg">
+            <div className="modal-header flex items-center justify-between gap-4">
+              <div>
+                <h3 className="text-lg font-bold text-gray-900">新建素材 / 直接发布</h3>
+                <p className="mt-1 text-xs text-gray-500">
+                  填表建一条素材（状态直接为「待发布」），确认后即刻发布到闲鱼。
+                </p>
+              </div>
+              <button type="button" onClick={() => setNewMaterialOpen(false)} className="rounded p-2 text-gray-500 hover:bg-gray-100" aria-label="关闭">
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+            <div className="modal-body grid gap-4 md:grid-cols-2">
+              <label className="text-xs font-bold text-gray-600">
+                账号（图片会传到该账号的闲鱼图床）
+                <select
+                  value={newMaterialForm.cookie_id}
+                  onChange={(event) => setNewMaterialForm({ ...newMaterialForm, cookie_id: event.target.value })}
+                  className="ios-input mt-1.5 w-full rounded-md px-3 py-2.5 text-sm"
+                >
+                  <option value="">选择账号</option>
+                  {accounts.map((account) => (
+                    <option key={account.id} value={account.id}>{accountNames.get(account.id)}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="text-xs font-bold text-gray-600">
+                价格
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={newMaterialForm.price}
+                  onChange={(event) => setNewMaterialForm({ ...newMaterialForm, price: event.target.value })}
+                  className="ios-input mt-1.5 w-full rounded-md px-3 py-2.5 text-sm"
+                />
+              </label>
+              <label className="text-xs font-bold text-gray-600 md:col-span-2">
+                标题 <span className="text-red-500">*</span>
+                <input
+                  value={newMaterialForm.title}
+                  onChange={(event) => setNewMaterialForm({ ...newMaterialForm, title: event.target.value })}
+                  className="ios-input mt-1.5 w-full rounded-md px-3 py-2.5 text-sm"
+                />
+              </label>
+              <label className="text-xs font-bold text-gray-600 md:col-span-2">
+                描述
+                <textarea
+                  rows={4}
+                  value={newMaterialForm.description}
+                  onChange={(event) => setNewMaterialForm({ ...newMaterialForm, description: event.target.value })}
+                  className="ios-input mt-1.5 w-full resize-y rounded-md px-3 py-2.5 text-sm"
+                />
+              </label>
+              <div className="md:col-span-2">
+                <span className="text-xs font-bold text-gray-600">图片（可多选，直接上传到闲鱼图床）</span>
+                <div className="mt-1.5 flex flex-wrap items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => newMaterialFilesRef.current?.click()}
+                    className="ios-btn-secondary flex items-center gap-2 rounded-md px-4 py-2.5 text-sm"
+                  >
+                    <ImagePlus className="h-4 w-4" />
+                    选择本地图片
+                  </button>
+                  <input
+                    ref={newMaterialFilesRef}
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    onChange={pickNewMaterialFiles}
+                    className="hidden"
+                  />
+                  <span className="text-xs text-gray-500">已选 {newMaterialFiles.length} 张</span>
+                  {newMaterialFiles.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setNewMaterialFiles([]);
+                        if (newMaterialFilesRef.current) newMaterialFilesRef.current.value = '';
+                      }}
+                      className="text-xs font-bold text-gray-500 hover:text-gray-900"
+                    >
+                      清空
+                    </button>
+                  )}
+                </div>
+                {newMaterialFiles.length > 0 && (
+                  <ul className="mt-2 max-h-28 space-y-1 overflow-y-auto text-xs text-gray-600">
+                    {newMaterialFiles.map((file) => (
+                      <li key={`${file.name}-${file.size}`} className="truncate">
+                        {file.name}（{(file.size / 1024).toFixed(0)} KB）
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <p className="mt-2 text-[11px] leading-4 text-gray-400">
+                  图片按所选账号上传；返回的是闲鱼 CDN 链接。发布前还会经过写限流（默认 1 次/分钟、每日 20 次）。
+                </p>
+              </div>
+            </div>
+            <div className="modal-footer flex flex-wrap items-center justify-end gap-2">
+              {newMaterialBusy && (
+                <span className="mr-auto flex items-center gap-2 text-xs text-gray-500">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  {newMaterialBusy.startsWith('upload') ? '正在上传图片到闲鱼图床…' : '正在创建素材…'}
+                </span>
+              )}
+              <button type="button" onClick={() => setNewMaterialOpen(false)} className="ios-btn-secondary rounded-md px-4 py-2.5 text-sm">
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={newMaterialBusy !== ''}
+                onClick={() => void submitNewMaterial()}
+                className="ios-btn-primary flex items-center gap-2 rounded-md px-4 py-2.5 text-sm disabled:opacity-50"
+              >
+                {newMaterialBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+                创建并发布
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {itemDeletePreview && (
+        <ConfirmDialog
+          open
+          danger
+          title="确认删除商品"
+          confirmLabel="确认删除"
+          requireText={itemDeletePreview.prepared.require_text}
+          loading={busyKey === `item-delete-${itemDeletePreview.item.item_id}`}
+          onConfirm={() => void confirmItemDeleteExecute()}
+          onCancel={() => setItemDeletePreview(null)}
+        >
+          <div className="space-y-3 text-sm">
+            <NoticeBanner
+              type="warning"
+              message="该操作调用 com.taobao.idle.item.delete v1.1，实测语义为不可逆删除（不是下架）。删除后闲鱼端商品消失。"
+            />
+            <div className="rounded bg-red-50 p-2 text-xs leading-5 text-red-700" data-testid="item-delete-summary">
+              {itemDeletePreview.prepared.summary}
+            </div>
+            <dl className="grid gap-1.5 text-xs">
+              <div className="flex justify-between gap-3">
+                <dt className="text-gray-500">账号</dt>
+                <dd className="font-medium text-gray-800">
+                  {accountNames.get(itemDeletePreview.item.cookie_id) || itemDeletePreview.item.cookie_id}
+                </dd>
+              </div>
+              <div className="flex justify-between gap-3">
+                <dt className="text-gray-500">商品 ID</dt>
+                <dd className="font-mono font-medium text-gray-800">{itemDeletePreview.item.item_id}</dd>
+              </div>
+              <div className="flex justify-between gap-3">
+                <dt className="text-gray-500">需键入</dt>
+                <dd className="font-mono font-bold text-red-700">{itemDeletePreview.prepared.require_text}</dd>
+              </div>
+            </dl>
           </div>
         </ConfirmDialog>
       )}

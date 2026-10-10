@@ -1602,3 +1602,105 @@ export const getWriteGuardStatus = async (cookieId?: string): Promise<WriteGuard
   );
   return response.data;
 };
+
+// ============================================================================
+// v4（2026-10-10）：填表发布（新建素材）+ 单个商品删除 + 闲鱼图床
+// 对应后端 POST /xianyu-image、POST /product-automation/materials、
+// POST /product-automation/items/{cid}/{iid}/delete[/prepare]。
+// ============================================================================
+
+/** 闲鱼 CDN 图床链接（发布 payload 的 imageInfoDOList 要的就是它）。 */
+export interface XianyuImageResult {
+  url: string;
+  width: number | null;
+  height: number | null;
+  size: number | null;
+}
+
+/**
+ * 本地图片 → **闲鱼 CDN 链接**。
+ *
+ * 与 `uploadImage()`（存本地磁盘给卡券用）不同：这里把图片传到**所填账号**的闲鱼图床，
+ * 所以必须带 cookieId。纯 HTTP，不走浏览器。
+ */
+export const uploadXianyuImage = async (
+  file: File,
+  cookieId: string,
+): Promise<XianyuImageResult> => {
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('cookie_id', cookieId);
+  const response = await post<{ success: boolean; data: XianyuImageResult }>(
+    '/xianyu-image',
+    formData,
+  );
+  return response.data;
+};
+
+export interface ProductMaterialCreateInput {
+  cookie_id: string;
+  title: string;
+  description?: string;
+  price?: number | null;
+  category?: string;
+  /** 闲鱼 CDN 链接（前端先调 uploadXianyuImage 拿到） */
+  images?: string[];
+}
+
+/** 新建素材（「填表发布」入口）：后端插一行 `product_materials`，`publish_status='ready'`。 */
+export const createProductMaterial = async (
+  data: ProductMaterialCreateInput,
+): Promise<ProductMaterial> => {
+  const response = await post<{ success: boolean; data: ProductMaterial }>(
+    '/product-automation/materials',
+    data,
+  );
+  return response.data;
+};
+
+export interface ItemDeletePrepareResult {
+  confirm_token: string;
+  cookie_id: string;
+  item_id: string;
+  item_title: string;
+  /** 需一字不差键入的确认文本（商品 ID 后 4 位） */
+  require_text: string;
+  summary: string;
+}
+
+export interface ItemDeleteResult {
+  run_id: number;
+  cookie_id: string;
+  item_id: string;
+  ok: boolean;
+  status: string;
+  semantics: string | null;
+  message: string;
+  local_record_removed: boolean;
+  summary: string;
+}
+
+/** 单个商品删除的一次性确认令牌（TTL 300s）。 */
+export const prepareItemDelete = async (
+  cookieId: string,
+  itemId: string,
+): Promise<ItemDeletePrepareResult> => {
+  const response = await post<{ success: boolean; data: ItemDeletePrepareResult }>(
+    `/product-automation/items/${encodeURIComponent(cookieId)}/${encodeURIComponent(itemId)}/delete/prepare`,
+    {},
+  );
+  return response.data;
+};
+
+/** 真删除单个商品（不可逆；后端复用 utils/item_delete.delete_item，过写限流）。 */
+export const confirmItemDelete = async (
+  cookieId: string,
+  itemId: string,
+  confirmToken: string,
+): Promise<ItemDeleteResult> => {
+  const response = await post<{ success: boolean; data: ItemDeleteResult }>(
+    `/product-automation/items/${encodeURIComponent(cookieId)}/${encodeURIComponent(itemId)}/delete`,
+    { confirm_token: confirmToken },
+  );
+  return response.data;
+};

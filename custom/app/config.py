@@ -108,7 +108,7 @@ SLIDER_ROUTE_C = config.get('SLIDER_ROUTE_C', {
     # 路线 C（VM101 真机输入后端）客户端配置，见 utils/slider_route_c.py。
     # 默认开启；v2（T7）后容器浏览器方案已删除，路线 C 是唯一路径、失败不回退。
     'enabled': True,
-    'endpoint': 'http://<VM100_IP>:8799',
+    'endpoint': 'http://127.0.0.1:8799',
     'timeout': 180,
     'connect_timeout': 5,
     'failure_threshold': 3,

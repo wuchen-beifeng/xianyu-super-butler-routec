@@ -8,5 +8,5 @@ if [ -f /app/data/SLIDER_ROUTE_C_DISABLED ]; then
     echo "[routec] kill switch 存在，跳过启动"
     exit 0
 fi
-echo "[routec] 启动 solver :8799（driver/CDP -> VM100）"
+echo "[routec] 启动 solver :8799（driver/CDP -> 隧道落点）"
 exec python "$DIR/solver.py" --bind 127.0.0.1 --port 8799 --token-file "$DIR/token"

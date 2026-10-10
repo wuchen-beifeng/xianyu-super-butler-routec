@@ -18,6 +18,8 @@ import {
   refreshAccountProfile,
   getRiskControlStatus,
   requestFreshCaptchaUrl,
+  startPasswordLogin,
+  checkPasswordLogin,
 } from '../services/api';
 import { confirmAction, notify } from '../services/feedback';
 import {Power, Edit2, Trash2, QrCode, X, Check, Loader2, MessageSquare, RefreshCw, Save, User, Clock, Key, Eye, EyeOff, Bot, Settings, MapPin, Users, ShieldCheck} from 'lucide-react';
@@ -45,6 +47,13 @@ const AccountList: React.FC = () => {
   const [verificationUrl, setVerificationUrl] = useState<string>('');
   const qrPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const qrSessionRef = useRef<string>('');
+  // 密码登录测试（v4）：手动触发一次真机密码登录链路，用于验证链路是否通
+  const [showPwdLoginModal, setShowPwdLoginModal] = useState(false);
+  const [pwdLoginAccount, setPwdLoginAccount] = useState<string>('');
+  const [pwdLoginStatus, setPwdLoginStatus] = useState<'idle' | 'processing' | 'success' | 'need_manual' | 'failed' | 'unknown'>('idle');
+  const [pwdLoginError, setPwdLoginError] = useState<string>('');
+  const [pwdLoginShot, setPwdLoginShot] = useState<string>('');
+  const pwdPollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [activeModal, setActiveModal] = useState<ModalType>(null);
   const [editingAccount, setEditingAccount] = useState<AccountDetail | null>(null);
   const [refreshingProfileId, setRefreshingProfileId] = useState<string | null>(null);
@@ -137,6 +146,7 @@ const AccountList: React.FC = () => {
       clearInterval(timer);
       qrSessionRef.current = '';
       if (qrPollTimerRef.current) clearTimeout(qrPollTimerRef.current);
+      if (pwdPollRef.current) clearTimeout(pwdPollRef.current);
     };
   }, []);
 
@@ -308,6 +318,72 @@ const AccountList: React.FC = () => {
     }
   };
 
+  // ── 密码登录测试（v4）──────────────────────────────────────────────────
+  // 手动触发「一次」密码登录，用于验证真机链路是否通。自动触发条件是
+  // 「免密刷新连续失败 pwd_login_fail_threshold（默认 5）次」（设置页可改）。
+  const openPwdLoginModal = () => {
+    setShowPwdLoginModal(true);
+    setPwdLoginStatus('idle');
+    setPwdLoginError('');
+    setPwdLoginShot('');
+    if (!pwdLoginAccount && accounts[0]) setPwdLoginAccount(accounts[0].id);
+  };
+
+  const closePwdLoginModal = () => {
+    if (pwdPollRef.current) {
+      clearTimeout(pwdPollRef.current);
+      pwdPollRef.current = null;
+    }
+    setShowPwdLoginModal(false);
+  };
+
+  const pollPwdLogin = async (sessionId: string, attempt: number) => {
+    try {
+      const res = await checkPasswordLogin(sessionId);
+      setPwdLoginStatus(res.status);
+      setPwdLoginError(res.error || '');
+      if (res.screenshot_url) setPwdLoginShot(res.screenshot_url);
+      if (res.status === 'processing') {
+        if (attempt < 200) {
+          pwdPollRef.current = setTimeout(() => void pollPwdLogin(sessionId, attempt + 1), 3000);
+        } else {
+          setPwdLoginStatus('failed');
+          setPwdLoginError('轮询超时（约 10 分钟）：请查看容器日志，或稍后重试。');
+        }
+        return;
+      }
+      if (res.status === 'success') {
+        notify('密码登录成功：Cookie 已更新，账号已恢复监听', 'success');
+        loadAccounts({ silent: true });
+      } else if (res.status === 'need_manual') {
+        notify('需要人工处理（人脸 / 短信验证），已推 QQ 通知', 'warning');
+      } else if (res.status === 'failed') {
+        notify(`密码登录失败：${res.error || '未知原因'}`, 'error');
+      }
+    } catch (error) {
+      setPwdLoginStatus('failed');
+      setPwdLoginError(error instanceof Error ? error.message : '状态查询失败');
+    }
+  };
+
+  const startPwdLoginTest = async () => {
+    if (!pwdLoginAccount) {
+      notify('请先选择账号', 'warning');
+      return;
+    }
+    if (pwdPollRef.current) clearTimeout(pwdPollRef.current);
+    setPwdLoginStatus('processing');
+    setPwdLoginError('');
+    setPwdLoginShot('');
+    try {
+      const res = await startPasswordLogin(pwdLoginAccount);
+      await pollPwdLogin(res.session_id, 0);
+    } catch (error) {
+      setPwdLoginStatus('failed');
+      setPwdLoginError(error instanceof Error ? error.message : '启动失败');
+    }
+  };
+
   const startQRLogin = async () => {
     qrSessionRef.current = '';
     if (qrPollTimerRef.current) clearTimeout(qrPollTimerRef.current);
@@ -465,13 +541,22 @@ const AccountList: React.FC = () => {
         icon={Users}
         badge={<span className="status-badge status-badge-info">{accounts.length} 个账号</span>}
         actions={(
-          <button
-            onClick={startQRLogin}
-            className="ios-btn-primary flex items-center justify-center gap-2 rounded-md px-4 py-2 text-sm"
-          >
-            <QrCode className="h-4 w-4" />
-            扫码添加账号
-          </button>
+          <div className="flex flex-wrap gap-2">
+            <button
+              onClick={openPwdLoginModal}
+              className="ios-btn-secondary flex items-center justify-center gap-2 rounded-md px-4 py-2 text-sm"
+            >
+              <Key className="h-4 w-4" />
+              密码登录测试
+            </button>
+            <button
+              onClick={startQRLogin}
+              className="ios-btn-primary flex items-center justify-center gap-2 rounded-md px-4 py-2 text-sm"
+            >
+              <QrCode className="h-4 w-4" />
+              扫码添加账号
+            </button>
+          </div>
         )}
       />
 
@@ -724,6 +809,117 @@ const AccountList: React.FC = () => {
               </div>
           </div>,
           document.body
+      )}
+
+      {/* 密码登录测试（v4）：手动触发一次真机密码登录 */}
+      {showPwdLoginModal && createPortal(
+        <div className="modal-overlay">
+          <div className="modal-container" style={{maxWidth: '560px'}}>
+            <div className="modal-header flex items-start justify-between gap-4">
+              <div>
+                <h3 className="text-lg font-bold text-gray-900">密码登录测试</h3>
+                <p className="mt-1 text-xs text-gray-500">
+                  手动触发<strong>一次</strong>账号密码登录（CDP 导航 + VM101 真机输入），用于验证链路。
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={closePwdLoginModal}
+                className="rounded p-2 text-gray-500 hover:bg-gray-100"
+                aria-label="关闭密码登录测试"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="modal-body space-y-4">
+              <div className="rounded-md border border-blue-200 bg-blue-50 p-3 text-xs leading-5 text-blue-900">
+                自动触发条件：免密刷新（cookie 续期）<strong>连续失败</strong>达到「设置 → 账号密码自动登录」
+                的阈值（默认 <strong>5</strong> 次）后自动尝试；这里只是手动点一次用来验证。
+                出现人脸 / 短信验证不会自动过，会截图并推 QQ 通知。
+              </div>
+
+              <label className="block text-sm font-bold text-gray-700">
+                账号
+                <select
+                  value={pwdLoginAccount}
+                  onChange={(e) => setPwdLoginAccount(e.target.value)}
+                  className="ios-input mt-1.5 w-full rounded-md px-3 py-2.5"
+                  disabled={pwdLoginStatus === 'processing'}
+                >
+                  {accounts.length === 0 && <option value="">（暂无账号）</option>}
+                  {accounts.map((account) => (
+                    <option key={account.id} value={account.id}>
+                      {account.nickname || account.remark || `账号 ${account.id.slice(0, 6)}`}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              {pwdLoginStatus !== 'idle' && (
+                <div
+                  className={`rounded-md border p-3 text-sm ${
+                    pwdLoginStatus === 'success'
+                      ? 'border-green-200 bg-green-50 text-green-800'
+                      : pwdLoginStatus === 'need_manual'
+                        ? 'border-amber-200 bg-amber-50 text-amber-900'
+                        : pwdLoginStatus === 'failed'
+                          ? 'border-red-200 bg-red-50 text-red-800'
+                          : 'border-gray-200 bg-gray-50 text-gray-700'
+                  }`}
+                >
+                  <div className="flex items-center gap-2 font-bold">
+                    {pwdLoginStatus === 'processing' && <Loader2 className="h-4 w-4 animate-spin" />}
+                    {pwdLoginStatus === 'processing' && '进行中（真机登录流程最长约 240 秒）…'}
+                    {pwdLoginStatus === 'success' && '成功：Cookie 已更新，账号已恢复监听'}
+                    {pwdLoginStatus === 'need_manual' && '需人工处理：人脸 / 短信验证，已推 QQ 通知'}
+                    {pwdLoginStatus === 'failed' && '失败'}
+                    {pwdLoginStatus === 'unknown' && '会话不存在或已过期'}
+                  </div>
+                  {pwdLoginError && <p className="mt-2 text-xs leading-5">{pwdLoginError}</p>}
+                  {pwdLoginStatus === 'need_manual' && (
+                    <p className="mt-2 text-xs leading-5">
+                      请到 VM101 的 Chrome 里完成验证；通过后账号会自动恢复。若已无法完成，可在
+                      「设置 → 账号密码自动登录」里重置失败计数与冷却后重试。
+                    </p>
+                  )}
+                  {pwdLoginShot && (
+                    <div className="mt-3">
+                      <div className="mb-1 text-xs font-bold">验证截图</div>
+                      <img
+                        src={pwdLoginShot}
+                        alt="密码登录验证截图"
+                        className="max-h-72 w-full rounded border border-gray-200 object-contain"
+                      />
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="modal-footer flex w-full gap-2">
+              <button
+                type="button"
+                onClick={closePwdLoginModal}
+                className="ios-btn-secondary flex-1 rounded-md px-4 py-2.5 text-sm"
+              >
+                关闭
+              </button>
+              <button
+                type="button"
+                onClick={() => void startPwdLoginTest()}
+                disabled={pwdLoginStatus === 'processing' || !pwdLoginAccount}
+                className="ios-btn-primary flex flex-1 items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm disabled:opacity-60"
+              >
+                {pwdLoginStatus === 'processing'
+                  ? <Loader2 className="h-4 w-4 animate-spin" />
+                  : <Key className="h-4 w-4" />}
+                {pwdLoginStatus === 'processing' ? '登录中…' : '开始密码登录测试'}
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body
       )}
 
       {/* 编辑账号弹窗 */}

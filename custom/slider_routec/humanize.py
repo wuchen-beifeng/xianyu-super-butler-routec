@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""humanize.py -- 轨迹人性化 + 预运动路径生成（VM100 侧）。
+"""humanize.py -- 轨迹人性化 + 预运动路径生成（应用机侧）。
 
 输出格式契约（与 driver.ps1 的 DoDrag 严格对应）：
     points = [[cum_dx, cum_dy, dt_ms], ...]

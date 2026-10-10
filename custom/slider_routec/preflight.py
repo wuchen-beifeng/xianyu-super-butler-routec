@@ -35,8 +35,8 @@ if HERE not in sys.path:
 import driverctl  # noqa: E402
 
 # 与 routec_core 共用同一组环境变量（默认值必须一致）。
-DRIVER_URL = os.environ.get("ROUTEC_DRIVER_URL", "http://<VM100_IP>:8791/")
-CDP_URL = os.environ.get("ROUTEC_CDP_URL", "http://<VM100_IP>:9222").rstrip("/")
+DRIVER_URL = os.environ.get("ROUTEC_DRIVER_URL", "http://<VM102_IP>:8791/")
+CDP_URL = os.environ.get("ROUTEC_CDP_URL", "http://<VM102_IP>:9222").rstrip("/")
 driverctl.DRIVER_URL = DRIVER_URL
 
 OVERALL_MAX_S = 90.0      # 整体硬上限（硬约束：check_and_heal ≤ 90s）

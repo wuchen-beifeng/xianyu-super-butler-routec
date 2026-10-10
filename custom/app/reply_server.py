@@ -7,6 +7,7 @@ from typing import List, Tuple, Optional, Dict, Any
 from pathlib import Path
 import secrets
 import shutil
+import tempfile
 import time
 import json
 import os
@@ -5443,6 +5444,154 @@ def get_write_guard_status(
     }
 
 
+# ==================== v4（2026-10-10）：填表发布 + 单个商品删除 ====================
+#
+# 只**新增**路由：既有路径 / 入参 / 返回形状一字未改。
+# 新路由一律返回 {"success": true, "data": {...}}（与同文件既有路由一致，
+# 前端 api.ts 的封装都是取 response.data）。
+#
+# 三条能力：
+#   1) POST /xianyu-image                本地图片 → 闲鱼 CDN 链接（需指定账号；
+#                                        图片传到该账号的闲鱼图床，纯 HTTP 不用浏览器）
+#   2) POST /product-automation/materials  新建素材（填表发布；publish_status 直接 ready）
+#   3) POST /product-automation/items/{cid}/{iid}/delete[/prepare]  单个商品真删除
+#      （复用 ConfirmTokenStore 的一次性令牌，TTL 300s）
+
+# /xianyu-image 单文件体积上限（压缩前）；实际上传前 utils/image_uploader 还会压到 5MB 内
+XIANYU_IMAGE_MAX_BYTES = 20 * 1024 * 1024
+XIANYU_IMAGE_ALLOWED_EXT = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif")
+
+
+@app.post("/xianyu-image")
+async def upload_image_to_xianyu(
+    file: UploadFile = File(...),
+    cookie_id: str = Form(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """本地图片 → **闲鱼 CDN 链接**。
+
+    与 ``/upload-image``（把图片存本地磁盘，给卡券用）不同：这里走
+    ``utils/image_uploader.ImageUploader(账号cookie).upload_image(路径)``，把图片传到
+    **所填账号**的闲鱼图床，返回 ``{url, width, height, size}`` —— 发布 payload 的
+    ``imageInfoDOList`` 要的就是这个链接。纯 HTTP，不用浏览器。临时文件用完即删。
+    """
+    cookie_id = str(cookie_id or "").strip()
+    if not cookie_id:
+        raise HTTPException(status_code=400, detail="缺少 cookie_id：图片必须传到指定账号的图床")
+    owned = db_manager.get_all_cookies(current_user["user_id"]) or {}
+    if cookie_id not in owned:
+        raise HTTPException(status_code=404, detail="账号不存在或不属于当前用户")
+    cookies_str = owned.get(cookie_id) or db_manager.get_cookie(cookie_id)
+    if not cookies_str:
+        raise HTTPException(status_code=400, detail="账号 Cookie 不存在，请先重新登录该账号")
+
+    if file.content_type and not str(file.content_type).startswith("image/"):
+        raise HTTPException(status_code=400, detail="格式不支持：只接受图片文件（jpg / png / webp）")
+    suffix = os.path.splitext(str(file.filename or ""))[1].lower()
+    if suffix and suffix not in XIANYU_IMAGE_ALLOWED_EXT:
+        raise HTTPException(
+            status_code=400,
+            detail="格式不支持：只接受 jpg / jpeg / png / webp / bmp / gif",
+        )
+    payload_bytes = await file.read()
+    if not payload_bytes:
+        raise HTTPException(status_code=400, detail="文件为空，请重新选择图片")
+    if len(payload_bytes) > XIANYU_IMAGE_MAX_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"文件过大：最大 {XIANYU_IMAGE_MAX_BYTES // 1024 // 1024} MB"
+                   f"（当前 {len(payload_bytes) / 1024 / 1024:.1f} MB）",
+        )
+
+    tmp_dir = tempfile.mkdtemp(prefix="xianyu-image-")
+    tmp_path = os.path.join(tmp_dir, f"upload{suffix or '.jpg'}")
+    uploader = None
+    try:
+        with open(tmp_path, "wb") as handle:
+            handle.write(payload_bytes)
+        from utils.image_uploader import ImageUploader
+
+        uploader = ImageUploader(cookies_str)
+        result = await uploader.upload_image(tmp_path)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("闲鱼图床上传异常")
+        raise HTTPException(
+            status_code=502, detail=f"上传失败：{type(exc).__name__}: {str(exc)[:160]}"
+        )
+    finally:
+        if uploader is not None:
+            try:
+                await uploader.close_session()
+            except Exception:
+                pass
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if not result or not result.get("url"):
+        raise HTTPException(
+            status_code=502,
+            detail="上传到闲鱼图床失败：通常是该账号 Cookie 已失效，或图片过大 / 格式不被接受。"
+                   "请刷新账号 Cookie 后重试。",
+        )
+    log_with_user("info", f"闲鱼图床上传成功（{len(payload_bytes)} 字节）", current_user)
+    return {
+        "success": True,
+        "data": {
+            "url": result.get("url"),
+            "width": result.get("width"),
+            "height": result.get("height"),
+            "size": result.get("size") or len(payload_bytes),
+        },
+    }
+
+
+@app.post("/product-automation/materials")
+def create_product_material(
+    payload: Dict[str, Any],
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """新建素材（「填表发布」入口）：插一行 ``product_materials``，``publish_status='ready'``。
+
+    发布本体复用既有 ``/materials/{id}/publish/prepare`` → ``/publish``。
+    """
+    return _product_automation_call(
+        lambda: product_automation.create_material(current_user["user_id"], payload)
+    )
+
+
+@app.post("/product-automation/items/{cookie_id}/{item_id}/delete/prepare")
+def prepare_product_item_delete(
+    cookie_id: str,
+    item_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """单个商品删除的一次性确认令牌（含商品标题与需键入后 4 位 ``require_text``）。"""
+    return _product_automation_call(
+        lambda: product_automation.prepare_item_delete(
+            current_user["user_id"], cookie_id, item_id
+        )
+    )
+
+
+@app.post("/product-automation/items/{cookie_id}/{item_id}/delete")
+def execute_product_item_delete(
+    cookie_id: str,
+    item_id: str,
+    payload: ConfirmTokenRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """真删除单个商品（不可逆；复用 W8 的 ``utils/item_delete.delete_item``，过写限流）。"""
+    return _product_automation_call(
+        lambda: product_automation.execute_item_delete(
+            current_user["user_id"],
+            cookie_id,
+            item_id,
+            confirm_token=payload.confirm_token,
+        )
+    )
+
+
 # ==================== 备份和恢复 API ====================
 
 @app.get("/backup/export")
@@ -9009,7 +9158,9 @@ API_ROOTS = {
     'qr-login', 'quick-phrases', 'register', 'registration-settings',
     'registration-status', 'risk-control-logs', 'send-message',
     'send-verification-code', 'static', 'system', 'system-settings',
-    'upload-image', 'user-settings', 'verify', 'verify-captcha', 'xianyu'
+    'upload-image', 'user-settings', 'verify', 'verify-captcha', 'xianyu',
+    # v4：本地图片 → 闲鱼 CDN 链接（multipart）
+    'xianyu-image'
 }
 
 
